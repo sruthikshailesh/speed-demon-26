@@ -59,3 +59,4 @@ python3 check.py a --data data/a --expected <sha256>
 - <reduce peak memory>
 - <parallelise parsing if not done yet>
 - Re-verify the sha256 on the full dataset after every change.
+
