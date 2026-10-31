@@ -1,10 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <chrono>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <string>
@@ -32,7 +29,6 @@ struct Work {
     std::vector<uint32_t> ep_slots;
     std::vector<Group> groups;
     std::vector<uint32_t> group_slots;
-    Group* last = nullptr;
 };
 
 inline uint64_t fnv1a(const char* s, size_t n) {
@@ -273,11 +269,6 @@ bool write_output(const std::vector<std::string>& ep_names, const std::vector<Gr
 }  // namespace
 
 int main(int argc, char** argv) {
-#ifdef TIMING
-    using Clock = std::chrono::steady_clock;
-    auto t0 = Clock::now();
-    auto t_parse = t0, t_merge = t0, t_pct = t0, t_sort = t0, t_out = t0;
-#endif
     const char* data_dir = "/data";
     const char* out_dir = "/out";
     for (int i = 1; i < argc; ++i) {
@@ -304,9 +295,6 @@ int main(int argc, char** argv) {
     std::vector<std::thread> threads;
     threads.reserve(kThreads);
     size_t lo = 0;
-#ifdef TIMING
-    t_parse = Clock::now();
-#endif
     for (int t = 0; t < kThreads; ++t) {
         size_t hi = (t + 1 == kThreads) ? file_size : (file_size * size_t(t + 1)) / size_t(kThreads);
         if (hi < file_size) {
@@ -317,9 +305,6 @@ int main(int argc, char** argv) {
         lo = hi;
     }
     for (std::thread& t : threads) t.join();
-#ifdef TIMING
-    auto t1 = Clock::now();
-#endif
 
     std::vector<Ep> all;
     std::vector<std::vector<uint32_t>> remap(kThreads);
@@ -346,9 +331,6 @@ int main(int argc, char** argv) {
             groups.push_back(Group{g.hour, remap[t][g.ep], g.count, g.errors, 0, 0, 0, std::move(g.lat)});
         }
     }
-#ifdef TIMING
-    t_merge = Clock::now();
-#endif
     std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
         if (a.hour != b.hour) return a.hour < b.hour;
         return a.ep < b.ep;
@@ -367,9 +349,6 @@ int main(int argc, char** argv) {
         i = j;
     }
     groups.swap(merged);
-#ifdef TIMING
-    t_pct = Clock::now();
-#endif
 
     std::atomic<size_t> next{0};
     std::vector<std::thread> pct(kThreads);
@@ -402,12 +381,6 @@ int main(int argc, char** argv) {
         });
     }
     for (std::thread& t : pct) t.join();
-#ifdef TIMING
-    auto t2 = Clock::now();
-#endif
-#ifdef TIMING
-    t_sort = Clock::now();
-#endif
     std::sort(groups.begin(), groups.end(), [&](const Group& a, const Group& b) {
         if (a.hour != b.hour) return a.hour < b.hour;
         const std::string& sa = ep_names[a.ep];
@@ -417,12 +390,6 @@ int main(int argc, char** argv) {
         if (c) return c < 0;
         return sa.size() < sb.size();
     });
-#ifdef TIMING
-    auto t3 = Clock::now();
-#endif
-#ifdef TIMING
-    t_out = Clock::now();
-#endif
     if (!write_output(ep_names, groups, out_dir)) {
         munmap(map, file_size);
         close(fd);
@@ -430,15 +397,5 @@ int main(int argc, char** argv) {
     }
     munmap(map, file_size);
     close(fd);
-#ifdef TIMING
-    auto t4 = Clock::now();
-    std::fprintf(stderr,
-        "parse %.3f ms\nmerge %.3f ms\npercentiles %.3f ms\nsort %.3f ms\noutput %.3f ms\n",
-        std::chrono::duration<double, std::milli>(t1 - t_parse).count(),
-        std::chrono::duration<double, std::milli>(t_merge - t1).count(),
-        std::chrono::duration<double, std::milli>(t2 - t_pct).count(),
-        std::chrono::duration<double, std::milli>(t3 - t_sort).count(),
-        std::chrono::duration<double, std::milli>(t4 - t_out).count());
-#endif
     return 0;
 }
