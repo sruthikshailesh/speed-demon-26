@@ -17,9 +17,9 @@
 
 namespace {
 
-constexpr int kThreads = 12;
+constexpr int kThreads = 6;
 
-struct Ep { const char* s; uint32_t len; };
+struct Ep { std::string s; uint32_t len; };
 struct Group {
     uint32_t hour, ep;
     uint64_t count, errors;
@@ -28,9 +28,49 @@ struct Group {
 };
 struct Work {
     std::vector<Ep> eps;
+    std::vector<uint32_t> ep_slots;
     std::vector<Group> groups;
-    Group* last = nullptr;
+    std::vector<uint32_t> group_slots;
 };
+
+inline uint64_t fnv1a(const char* s, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= uint8_t(s[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+inline void grow_ep_table(Work& w) {
+    std::vector<uint32_t> old = std::move(w.ep_slots);
+    const size_t new_cap = old.empty() ? 1024u : old.size() * 2u;
+    w.ep_slots.assign(new_cap, UINT32_MAX);
+    for (size_t i = 0; i < old.size(); ++i) {
+        if (old[i] == UINT32_MAX) continue;
+        const Ep& e = w.eps[old[i]];
+        const size_t n = e.s.size();
+        const uint64_t h = fnv1a(e.s.data(), n);
+        for (size_t j = h & (new_cap - 1u);; j = (j + 1u) & (new_cap - 1u)) {
+            if (w.ep_slots[j] == UINT32_MAX) { w.ep_slots[j] = old[i]; break; }
+        }
+    }
+}
+
+inline void grow_group_table(Work& w) {
+    std::vector<uint32_t> old = std::move(w.group_slots);
+    const size_t new_cap = old.empty() ? 1024u : old.size() * 2u;
+    w.group_slots.assign(new_cap, UINT32_MAX);
+    for (size_t i = 0; i < old.size(); ++i) {
+        if (old[i] == UINT32_MAX) continue;
+        const Group& g = w.groups[old[i]];
+        const uint64_t key = (uint64_t(g.hour) << 32) | uint64_t(g.ep);
+        const size_t mask = new_cap - 1u;
+        for (size_t j = ((key * 0x9E3779B97F4A7C15ull) >> 32) & mask;; j = (j + 1u) & mask) {
+            if (w.group_slots[j] == UINT32_MAX) { w.group_slots[j] = old[i]; break; }
+        }
+    }
+}
 
 inline uint32_t hour_key(const char* p) {
     const uint32_t y = (p[0] - '0') * 1000u + (p[1] - '0') * 100u + (p[2] - '0') * 10u + (p[3] - '0');
@@ -53,25 +93,40 @@ inline bool parse_u32(const char* b, const char* e, uint32_t& v) {
 }
 
 inline uint32_t add_ep(Work& w, const char* s, uint32_t len) {
-    for (uint32_t i = 0; i < w.eps.size(); ++i) {
-        const Ep& e = w.eps[i];
-        if (e.len == len && std::memcmp(e.s, s, len) == 0) return i;
+    if (w.ep_slots.empty()) w.ep_slots.assign(1024u, UINT32_MAX);
+    if ((w.eps.size() + 1u) * 10u > w.ep_slots.size() * 7u) grow_ep_table(w);
+    const uint64_t h = fnv1a(s, len);
+    const size_t mask = w.ep_slots.size() - 1u;
+    for (size_t i = h & mask;; i = (i + 1u) & mask) {
+        const uint32_t idx = w.ep_slots[i];
+        if (idx == UINT32_MAX) {
+            Ep e;
+            e.s.assign(s, len);
+            e.len = len;
+            w.eps.push_back(e);
+            w.ep_slots[i] = uint32_t(w.eps.size() - 1u);
+            return w.ep_slots[i];
+        }
+        const Ep& e = w.eps[idx];
+        if (e.len == len && std::memcmp(e.s.data(), s, len) == 0) return idx;
     }
-    w.eps.push_back(Ep{s, len});
-    return uint32_t(w.eps.size() - 1u);
 }
 
 inline Group* add_group(Work& w, uint32_t hour, uint32_t ep) {
-    if (w.last && w.last->hour == hour && w.last->ep == ep) return w.last;
-    for (Group& g : w.groups) {
-        if (g.hour == hour && g.ep == ep) {
-            w.last = &g;
-            return &g;
+    if (w.group_slots.empty()) w.group_slots.assign(1024u, UINT32_MAX);
+    if ((w.groups.size() + 1u) * 10u > w.group_slots.size() * 7u) grow_group_table(w);
+    const uint64_t key = (uint64_t(hour) << 32) | uint64_t(ep);
+    const size_t mask = w.group_slots.size() - 1u;
+    for (size_t i = ((key * 0x9E3779B97F4A7C15ull) >> 32) & mask;; i = (i + 1u) & mask) {
+        const uint32_t idx = w.group_slots[i];
+        if (idx == UINT32_MAX) {
+            w.groups.push_back(Group{hour, ep, 0, 0, 0, 0, 0, {}});
+            w.group_slots[i] = uint32_t(w.groups.size() - 1u);
+            return &w.groups.back();
         }
+        Group& g = w.groups[idx];
+        if (g.hour == hour && g.ep == ep) return &g;
     }
-    w.groups.push_back(Group{hour, ep, 0, 0, 0, 0, 0, {}});
-    w.last = &w.groups.back();
-    return w.last;
 }
 
 inline bool parse_line(const char* b, const char* e, uint32_t& hour, const char*& ep, uint32_t& ep_len, uint32_t& status, uint32_t& lat) {
@@ -261,7 +316,7 @@ int main(int argc, char** argv) {
             uint32_t j = 0;
             for (; j < uint32_t(all.size()); ++j) {
                 const Ep& x = all[j];
-                if (x.len == e.len && std::memcmp(x.s, e.s, e.len) == 0) break;
+                if (x.len == e.len && std::memcmp(x.s.data(), e.s.data(), e.len) == 0) break;
             }
             if (j == uint32_t(all.size())) all.push_back(e);
             remap[t][i] = j;
@@ -269,12 +324,12 @@ int main(int argc, char** argv) {
     }
 
     std::vector<std::string> ep_names(all.size());
-    for (uint32_t i = 0; i < uint32_t(all.size()); ++i) ep_names[i].assign(all[i].s, all[i].len);
+    for (uint32_t i = 0; i < uint32_t(all.size()); ++i) ep_names[i] = all[i].s;
 
     std::vector<Group> groups;
     for (int t = 0; t < kThreads; ++t) {
-        for (const Group& g : work[t].groups) {
-            groups.push_back(Group{g.hour, remap[t][g.ep], g.count, g.errors, 0, 0, 0, g.lat});
+        for (Group& g : work[t].groups) {
+            groups.push_back(Group{g.hour, remap[t][g.ep], g.count, g.errors, 0, 0, 0, std::move(g.lat)});
         }
     }
     std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
@@ -283,7 +338,7 @@ int main(int argc, char** argv) {
     });
     std::vector<Group> merged;
     for (size_t i = 0; i < groups.size();) {
-        Group g = groups[i];
+        Group g = std::move(groups[i]);
         size_t j = i + 1;
         while (j < groups.size() && groups[j].hour == g.hour && groups[j].ep == g.ep) {
             g.count += groups[j].count;
@@ -291,7 +346,7 @@ int main(int argc, char** argv) {
             g.lat.insert(g.lat.end(), groups[j].lat.begin(), groups[j].lat.end());
             ++j;
         }
-        merged.push_back(g);
+        merged.push_back(std::move(g));
         i = j;
     }
     groups.swap(merged);
