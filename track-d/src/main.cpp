@@ -1,5 +1,4 @@
 // Speed Demon 2026, Track D (Traverse): exact directed shortest paths.
-//
 // The graph is mmap'ed once and parsed in newline-aligned chunks. Worker-local
 // edge buckets build CSR without atomics on rows; a parallel BFS relabels nodes
 // for locality. Queries are grouped by source and answered by early-exit Dijkstra
