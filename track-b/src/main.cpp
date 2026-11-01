@@ -310,6 +310,8 @@ struct List {
     bool empty() const { return n == 0; }
 };
 
+inline bool same_list(List a, List b) { return a.p == b.p && a.n == b.n; }
+
 const uint32_t kZero = 0;
 const List kEmptyList{&kZero, 0};
 
@@ -374,12 +376,11 @@ void make_chunks(const char* data, size_t size, unsigned nchunks, std::vector<Ch
 // Feed (term id, document id, token position) for every corpus token that is
 // one of the query terms.  Every token still advances the position counter.
 // on_doc runs once per document so callers can record document boundaries.
-//
-// kLongTerms is true only when a query term itself exceeds the inline buffer.
-// Otherwise a longer corpus run cannot match anything, so the fallback folds
-// away and the scan loop keeps its fast path.
-template <bool kLongTerms, typename D, typename F>
-void scan_chunk(const Chunk& c, const TermTable& table, D&& on_doc, F&& on_token) {
+// A term longer than 32 bytes needs the slow path, but a whole run longer than
+// 32 bytes is not a plausible query term, so the branch stays out of the fast
+// loop.
+template <typename D, typename F>
+void scan_chunk(const Chunk& c, const TermTable& table, bool long_terms, D&& on_doc, F&& on_token) {
     const char* p = c.b;
     const char* const e = c.e;
     uint32_t doc = c.d0;
@@ -415,7 +416,7 @@ void scan_chunk(const Chunk& c, const TermTable& table, D&& on_doc, F&& on_token
                 uint64_t h = hash_bytes(buf, n);
                 uint32_t tid = table.find_h(buf, n, h);
                 if (tid != kNoTerm) on_token(tid, doc, pos);
-            } else if (kLongTerms) {
+            } else if (long_terms) {
                 thread_local std::string long_tok;
                 long_tok.resize(n);
                 for (uint32_t i = 0; i < n; ++i) long_tok[i] = static_cast<char>(g_tok[static_cast<unsigned char>(ts[i])]);
@@ -430,11 +431,11 @@ void scan_chunk(const Chunk& c, const TermTable& table, D&& on_doc, F&& on_token
     }
 }
 
-template <bool kLongTerms>
 void build_index(const char* data, size_t size, const TermTable& table, const std::vector<uint8_t>& need_pos,
                  unsigned nthreads, Index& idx) {
     const uint32_t nterms = table.size();
     const uint32_t N = nterms + 1;  // + sentinel for absent terms
+    const bool long_terms = table.max_len() > kMaxTermLen;
     idx.post_off.resize(N + 1);
     idx.pos_off.resize(N + 1);
     idx.pstart_off.resize(N + 1);
@@ -466,8 +467,8 @@ void build_index(const char* data, size_t size, const TermTable& table, const st
                 uint32_t localmax = 0;
                 std::vector<uint64_t>& stream = streams[u];
                 stream.reserve((static_cast<size_t>(chunks[u].e - chunks[u].b) >> 3) + 64);
-                scan_chunk<kLongTerms>(
-                    chunks[u], table,
+                scan_chunk(
+                    chunks[u], table, long_terms,
                     [&](uint32_t doc) { stream.push_back(kDocMark | doc); },
                     [&](uint32_t tid, uint32_t doc, uint32_t pos) {
                         if (clast[tid] != doc) {
@@ -740,7 +741,7 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
             List rhs = idx.list(terms[qu.toff + k]);
             ++k;
             if (cur.empty() || rhs.empty()) continue;
-            if (cur.p == rhs.p && cur.n == rhs.n) {
+            if (same_list(cur, rhs)) {
                 cur = kEmptyList;
                 continue;
             }
@@ -778,7 +779,7 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
         if (op == OP_AND) {
             for (uint32_t i = 1; i < m && !cur.empty(); ++i) {
                 List rhs = operands[i];
-                if (rhs.empty() || (cur.p == rhs.p && cur.n == rhs.n)) continue;
+                if (rhs.empty() || same_list(cur, rhs)) continue;
                 intersect_into(cur, rhs, *w);
                 cur = List{w->data(), static_cast<uint32_t>(w->size())};
                 std::swap(w, w2);
@@ -786,7 +787,7 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
         } else {
             for (uint32_t i = 1; i < m; ++i) {
                 List rhs = operands[i];
-                if (rhs.empty() || (cur.p == rhs.p && cur.n == rhs.n)) continue;
+                if (rhs.empty() || same_list(cur, rhs)) continue;
                 if (cur.empty()) {
                     cur = rhs;
                     continue;
@@ -968,11 +969,7 @@ int main(int argc, char** argv) {
     unsigned build_threads = clamp_threads("SD_BUILD_THREADS", std::min(hw, 12u), 64u);
 
     Index idx;
-    if (table.max_len() > kMaxTermLen)
-        build_index<true>(docs_file.data, docs_file.size, table, need_pos, build_threads, idx);
-    else
-        build_index<false>(docs_file.data, docs_file.size, table, need_pos, build_threads, idx);
-
+    build_index(docs_file.data, docs_file.size, table, need_pos, build_threads, idx);
 
     unsigned nthreads = clamp_threads("SD_THREADS", std::min(hw, 12u), 64u);
     if (nthreads > queries.size()) nthreads = static_cast<unsigned>(queries.size());
