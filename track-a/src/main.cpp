@@ -381,15 +381,6 @@ int main(int argc, char** argv) {
         });
     }
     for (std::thread& t : pct) t.join();
-    std::sort(groups.begin(), groups.end(), [&](const Group& a, const Group& b) {
-        if (a.hour != b.hour) return a.hour < b.hour;
-        const std::string& sa = ep_names[a.ep];
-        const std::string& sb = ep_names[b.ep];
-        const size_t n = std::min(sa.size(), sb.size());
-        const int c = std::memcmp(sa.data(), sb.data(), n);
-        if (c) return c < 0;
-        return sa.size() < sb.size();
-    });
     if (!write_output(ep_names, groups, out_dir)) {
         munmap(map, file_size);
         close(fd);
