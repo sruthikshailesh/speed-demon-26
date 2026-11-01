@@ -1,406 +1,266 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
+// Speed Demon 2026, Track A (Ingest): per-hour, per-endpoint latency summary.
+//
+// requests.log is mmap'ed and cut into newline-aligned slices, one per thread.
+// Each thread aggregates its slice in private open-addressing tables; the slices
+// are then merged in (hour, endpoint) order, and percentile selection plus text
+// formatting run together in parallel batches that are written out in order.
 
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <sched.h>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_map>
 #include <vector>
-
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 namespace {
 
-inline int affinity_threads() {
-#if defined(__linux__)
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof(set), &set) == 0) return std::max(1, CPU_COUNT(&set));
-#endif
-    unsigned n = std::thread::hardware_concurrency();
-    return n ? int(std::min<unsigned>(n, 12u)) : 12;
-}
+constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
+constexpr size_t kBatch = 2048;  // groups per output batch
 
-const int kThreads = std::min(12, std::max(1, affinity_threads()));
-
-struct Ep { const char* s; uint32_t len; };
 struct Group {
-    uint32_t hour, ep, count, errors;
-    uint32_t p50, p95, p99;
+    uint32_t hour, ep, count = 0, errors = 0, p50 = 0, p95 = 0, p99 = 0;
     std::vector<uint32_t> lat;
 };
-struct Work {
-    std::vector<std::string_view> ep;
-    std::unordered_map<std::string_view, uint32_t> ep_map;
+struct Work {  // one per thread; hash slots hold index + 1, 0 means empty
+    std::vector<std::string_view> ep;  // endpoint names, views into the mapping
+    std::vector<uint64_t> eh;          // their hashes
     std::vector<Group> group;
-    std::unordered_map<uint64_t, uint32_t> group_map;
-    size_t last = size_t(-1);
+    std::vector<uint32_t> es = std::vector<uint32_t>(2048), gs = std::vector<uint32_t>(4096);
+    size_t last = 0;                   // most recently used group
 };
 
-inline uint32_t hour_key(const char* p) {
-    const uint32_t y = (p[0] - '0') * 1000u + (p[1] - '0') * 100u + (p[2] - '0') * 10u + (p[3] - '0');
-    const uint32_t m = (p[5] - '0') * 10u + (p[6] - '0');
-    const uint32_t d = (p[8] - '0') * 10u + (p[9] - '0');
-    const uint32_t h = (p[11] - '0') * 10u + (p[12] - '0');
-    return ((y * 100u + m) * 100u + d) * 100u + h;
+int thread_count() {
+    unsigned n = std::thread::hardware_concurrency();
+#if defined(__linux__)
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof set, &set) == 0) n = CPU_COUNT(&set);
+#endif
+    return int(std::min(12u, std::max(1u, n)));
 }
 
-inline bool dec_u32(const char* b, const char* e, uint32_t& v) {
-    if (b >= e || *b < '0' || *b > '9') return false;
-    uint32_t x = 0;
-    for (; b < e && *b >= '0' && *b <= '9'; ++b) x = x * 10u + uint32_t(*b - '0');
-    v = x;
-    return true;
+template <class F> void par(int n, F f) {
+    std::vector<std::thread> ts;
+    for (int i = 0; i < n; ++i) ts.emplace_back([&f, i] { f(i); });
+    for (std::thread& t : ts) t.join();
 }
 
-inline uint32_t add_ep(Work& w, const char* s, uint32_t len) {
-    std::string_view key(s, len);
-    auto it = w.ep_map.find(key);
-    if (it != w.ep_map.end()) return it->second;
-    const uint32_t id = uint32_t(w.ep.size());
-    w.ep.push_back(key);
-    w.ep_map.emplace(key, id);
-    return id;
+inline uint64_t hash_bytes(const char* s, size_t n) {
+    uint64_t h = n * kMul;
+    for (; n >= 8; s += 8, n -= 8) {
+        uint64_t k;
+        std::memcpy(&k, s, 8);
+        h = (h ^ k) * kMul;
+        h ^= h >> 32;
+    }
+    uint64_t k = 0;
+    std::memcpy(&k, s, n);
+    h = (h ^ k) * kMul;
+    return h ^ (h >> 32);
 }
 
-inline Group* add_group(Work& w, uint32_t hour, uint32_t ep) {
-    const uint64_t key = (uint64_t(hour) << 32) | uint64_t(ep);
-    auto it = w.group_map.find(key);
-    if (it != w.group_map.end()) return &w.group[it->second];
-    if (w.last != size_t(-1) && w.group[w.last].hour == hour && w.group[w.last].ep == ep) return &w.group[w.last];
-    w.group.push_back(Group{hour, ep, 0, 0, 0, 0, {}});
-    const uint32_t idx = uint32_t(w.group.size() - 1u);
-    w.group_map.emplace(key, idx);
-    w.last = idx;
-    return &w.group[idx];
+inline size_t group_hash(uint32_t hour, uint32_t ep) { return size_t(((uint64_t(hour) << 32 | ep) * kMul) >> 32); }
+
+template <class H> void grow(std::vector<uint32_t>& s, size_t n, H hash) {
+    std::vector<uint32_t> t(s.size() * 2);
+    for (size_t i = 0; i < n; ++i) {
+        size_t j = hash(i) & (t.size() - 1);
+        while (t[j]) j = (j + 1) & (t.size() - 1);
+        t[j] = uint32_t(i + 1);
+    }
+    s.swap(t);
 }
 
-inline bool parse_line(const char* b, const char* e, uint32_t& hour, const char*& ep, uint32_t& ep_len, uint32_t& status, uint32_t& lat) {
-    if (e - b < 30) return false;
-    hour = hour_key(b);
-    const char* p = b + 27;
-    if (p >= e || *p != ' ') return false;
-    ++p;
-    while (p < e && *p != ' ') ++p;
-    if (p >= e) return false;
-    ++p;
-    const char* ep0 = p;
-    while (p < e && *p != ' ') ++p;
-    if (p <= ep0 || p >= e) return false;
-    ep = ep0;
-    ep_len = uint32_t(p - ep0);
-    if (ep_len == 0 || ep[0] != '/') return false;
-    if (*p != ' ') return false;
-    ++p;
-    const char* s0 = p;
-    while (p < e && *p != ' ') ++p;
-    if (p <= s0 || p >= e) return false;
-    uint32_t st = 0;
-    if (!dec_u32(s0, p, st)) return false;
-    if (st < 100u || st > 599u) return false;
-    status = st;
-    if (*p != ' ') return false;
-    ++p;
-    const char* lat0 = p;
-    while (p < e && *p != '\n') ++p;
-    if (p <= lat0) return false;
-    uint32_t v = 0;
-    if (!dec_u32(lat0, p, v)) return false;
-    lat = v;
-    return true;
+uint32_t add_ep(Work& w, std::string_view s) {
+    const uint64_t h = hash_bytes(s.data(), s.size());
+    const size_t m = w.es.size() - 1;
+    size_t j = h & m;
+    for (; w.es[j]; j = (j + 1) & m)
+        if (w.eh[w.es[j] - 1] == h && w.ep[w.es[j] - 1] == s) return w.es[j] - 1;
+    w.ep.push_back(s);
+    w.eh.push_back(h);
+    w.es[j] = uint32_t(w.ep.size());
+    if (w.ep.size() * 2 > w.es.size()) grow(w.es, w.ep.size(), [&](size_t i) { return w.eh[i]; });
+    return uint32_t(w.ep.size() - 1);
 }
 
-void parse_slice(const char* data, size_t lo, size_t hi, Work& w) {
-    const char* p = data + lo;
-    const char* end = data + hi;
+Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
+    const size_t m = w.gs.size() - 1;
+    size_t j = group_hash(hour, ep) & m;
+    for (; w.gs[j]; j = (j + 1) & m) {
+        Group& g = w.group[w.gs[j] - 1];
+        if (g.hour == hour && g.ep == ep) { w.last = w.gs[j] - 1; return g; }
+    }
+    w.group.push_back(Group{hour, ep});
+    w.last = w.group.size() - 1;
+    w.gs[j] = uint32_t(w.group.size());
+    if (w.group.size() * 2 > w.gs.size())
+        grow(w.gs, w.group.size(), [&](size_t i) { return group_hash(w.group[i].hour, w.group[i].ep); });
+    return w.group.back();
+}
+
+inline uint32_t hour_key(const char* p) {  // "YYYY-MM-DDTHH" -> YYYYMMDDHH
+    auto d = [&](int i) { return uint32_t(p[i] - '0'); };
+    return (((d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3)) * 100 + d(5) * 10 + d(6)) * 100 + d(8) * 10 + d(9)) * 100 +
+           d(11) * 10 + d(12);
+}
+
+// One line is "<27-byte timestamp> <method> <endpoint> <status> <latency>"; the spec guarantees it.
+void parse_slice(const char* p, const char* end, Work& w) {
+    const char* hp = nullptr;  // line whose hour prefix was last decoded
+    uint32_t hour = 0;
     while (p < end) {
-        const char* q = p;
-        while (q < end && *q != '\n') ++q;
-        const char* line_end = q < end ? q : end;
-        uint32_t hour, status, lat, elen;
-        const char* ep = nullptr;
-        if (parse_line(p, line_end, hour, ep, elen, status, lat)) {
-            uint32_t idx = add_ep(w, ep, elen);
-            Group* g = add_group(w, hour, idx);
-            ++g->count;
-            if (status >= 500u && status <= 599u) ++g->errors;
-            g->lat.push_back(lat);
-        }
-        if (q < end) p = q + 1; else break;
+        const char* e = static_cast<const char*>(std::memchr(p, '\n', size_t(end - p)));
+        if (!e) e = end;
+        const char* b = p;
+        p = e < end ? e + 1 : end;
+        if (e - b < 30) continue;
+        if (!hp || std::memcmp(b, hp, 13)) { hour = hour_key(b); hp = b; }
+        const char* q = static_cast<const char*>(std::memchr(b + 28, ' ', size_t(e - b - 28)));  // after method
+        if (!q) continue;
+        const char* ep = q + 1;
+        q = static_cast<const char*>(std::memchr(ep, ' ', size_t(e - ep)));  // after endpoint
+        if (!q) continue;
+        uint32_t st = 0, lat = 0;
+        const char* r = q + 1;
+        while (r < e && *r != ' ') st = st * 10 + uint32_t(*r++ - '0');
+        while (++r < e) lat = lat * 10 + uint32_t(*r - '0');
+        const uint32_t id = add_ep(w, std::string_view(ep, size_t(q - ep)));
+        Group* g = w.group.empty() ? nullptr : &w.group[w.last];
+        if (!g || g->hour != hour || g->ep != id) g = &add_group(w, hour, id);
+        ++g->count;
+        g->errors += st / 100 == 5;
+        g->lat.push_back(lat);
     }
 }
 
-inline void put_num(char*& p, uint64_t v) {
-    char b[32];
-    int n = 0;
-    do {
-        b[n++] = char('0' + (v % 10u));
-        v /= 10u;
-    } while (v);
-    while (n--) *p++ = b[n];
-}
-
-inline void put2(char*& p, uint32_t v) {
-    *p++ = char('0' + (v / 10u) % 10u);
-    *p++ = char('0' + v % 10u);
-}
-
-inline void put4(char*& p, uint32_t v) {
-    *p++ = char('0' + (v / 1000u) % 10u);
-    *p++ = char('0' + (v / 100u) % 10u);
-    *p++ = char('0' + (v / 10u) % 10u);
-    *p++ = char('0' + v % 10u);
-}
-
-inline void score_group(Group& g) {
+void score_group(Group& g) {  // nearest rank: ceil(p*n/100), 1-based
     std::vector<uint32_t>& v = g.lat;
     const size_t n = v.size();
-    if (n <= 32) {
-        for (size_t i = 1; i < n; ++i) {
-            const uint32_t x = v[i];
-            size_t j = i;
-            while (j && x < v[j - 1]) {
-                v[j] = v[j - 1];
-                --j;
-            }
-            v[j] = x;
-        }
-    } else {
-        const size_t r50 = (50ull * n + 99ull) / 100ull - 1ull;
-        const size_t r95 = (95ull * n + 99ull) / 100ull - 1ull;
-        const size_t r99 = (99ull * n + 99ull) / 100ull - 1ull;
-        std::nth_element(v.begin(), v.begin() + r50, v.end());
-        g.p50 = v[r50];
-        std::nth_element(v.begin() + r50, v.begin() + r95, v.end());
-        g.p95 = v[r95];
-        std::nth_element(v.begin() + r95, v.begin() + r99, v.end());
-        g.p99 = v[r99];
-        return;
+    const size_t r[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (99 * n + 99) / 100 - 1};
+    uint32_t* out[3] = {&g.p50, &g.p95, &g.p99};
+    if (n <= 32) std::sort(v.begin(), v.end());
+    for (int k = 0, lo = 0; k < 3; ++k) {  // each selection only has to look right of the previous one
+        if (n > 32) std::nth_element(v.begin() + lo, v.begin() + r[k], v.end());
+        *out[k] = v[r[k]];
+        lo = int(r[k]);
     }
-    g.p50 = v[(50ull * n + 99ull) / 100ull - 1ull];
-    g.p95 = v[(95ull * n + 99ull) / 100ull - 1ull];
-    g.p99 = v[(99ull * n + 99ull) / 100ull - 1ull];
 }
 
-inline void append_line(std::string& out, const Group& g, const std::string& ep) {
-    const uint32_t year = g.hour / 1000000u;
-    const uint32_t month = (g.hour / 10000u) % 100u;
-    const uint32_t day = (g.hour / 100u) % 100u;
-    const uint32_t h = g.hour % 100u;
-    char buf[256];
-    char* p = buf;
-    put4(p, year);
-    *p++ = '-';
-    put2(p, month);
-    *p++ = '-';
-    put2(p, day);
-    *p++ = 'T';
-    put2(p, h);
+inline void put(char*& p, uint64_t v, int width = 0) {
+    char t[24];
+    int n = 0;
+    do { t[n++] = char('0' + v % 10); v /= 10; } while (v || n < width);
+    while (n) *p++ = t[--n];
+}
+
+void append_line(std::string& out, const Group& g, std::string_view ep) {
+    char b[128], *p = b;
+    put(p, g.hour / 1000000, 4); *p++ = '-'; put(p, g.hour / 10000 % 100, 2); *p++ = '-';
+    put(p, g.hour / 100 % 100, 2); *p++ = 'T'; put(p, g.hour % 100, 2);
     std::memcpy(p, ":00:00Z ", 8); p += 8;
-    std::memcpy(p, ep.data(), ep.size()); p += ep.size();
-    *p++ = ' ';
-    const uint64_t eppm = uint64_t(g.errors) * 1000000ull / g.count;
-    put_num(p, g.count); *p++ = ' '; put_num(p, g.p50); *p++ = ' '; put_num(p, g.p95); *p++ = ' '; put_num(p, g.p99); *p++ = ' '; put_num(p, g.errors); *p++ = ' '; put_num(p, eppm); *p++ = '\n';
-    out.append(buf, size_t(p - buf));
-}
-
-bool write_output(const std::vector<std::string>& ep_names, std::vector<Group>& groups, const char* out_dir) {
-    std::string path(out_dir);
-    path += "/summary.txt";
-    if (::mkdir(out_dir, 0777) != 0 && errno != EEXIST) return false;
-    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return false;
-    const size_t threads = std::min<size_t>(kThreads, groups.size() ? groups.size() : 1u);
-    std::vector<std::string> bufs(threads);
-    std::vector<std::thread> ts;
-    ts.reserve(threads);
-    const size_t chunk = (groups.size() + threads - 1u) / threads;
-    for (size_t t = 0; t < threads; ++t) {
-        const size_t lo = t * chunk;
-        const size_t hi = std::min(groups.size(), lo + chunk);
-        if (lo >= hi) continue;
-        ts.emplace_back([&](size_t a, size_t b, size_t tid) {
-            std::string& out = bufs[tid];
-            size_t cap = 0;
-            for (size_t i = a; i < b; ++i) cap += ep_names[groups[i].ep].size() + 96u;
-            out.clear();
-            out.reserve(cap);
-            for (size_t i = a; i < b; ++i) append_line(out, groups[i], ep_names[groups[i].ep]);
-        }, lo, hi, t);
+    out.append(b, size_t(p - b));
+    out.append(ep);
+    p = b;
+    for (uint64_t v : {uint64_t(g.count), uint64_t(g.p50), uint64_t(g.p95), uint64_t(g.p99), uint64_t(g.errors),
+                       uint64_t(g.errors) * 1000000 / g.count}) {
+        *p++ = ' ';
+        put(p, v);
     }
-    for (std::thread& t : ts) t.join();
-    for (const std::string& s : bufs) {
-        const char* p = s.data();
-        size_t rem = s.size();
-        while (rem) {
-            ssize_t n = ::write(fd, p, rem);
-            if (n < 0) {
-                if (errno == EINTR) continue;
-                ::close(fd);
-                return false;
-            }
-            if (n == 0) { ::close(fd); return false; }
-            p += n;
-            rem -= size_t(n);
-        }
-    }
-    ::close(fd);
-    return true;
+    *p++ = '\n';
+    out.append(b, size_t(p - b));
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const char* data_dir = "/data";
-    const char* out_dir = "/out";
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--data") == 0 && i + 1 < argc) data_dir = argv[++i];
-        else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_dir = argv[++i];
-    }
+    const char *data_dir = "/data", *out_dir = "/out";
+    for (int i = 1; i + 1 < argc; i += 2) (std::strcmp(argv[i], "--data") ? out_dir : data_dir) = argv[i + 1];
 
-    std::string in = std::string(data_dir) + "/requests.log";
-    int fd = ::open(in.c_str(), O_RDONLY);
-    if (fd < 0) return 1;
+    const int fd = open((std::string(data_dir) + "/requests.log").c_str(), O_RDONLY);
     struct stat st;
-    if (::fstat(fd, &st) != 0) { ::close(fd); return 1; }
-    size_t file_size = size_t(st.st_size);
-    if (file_size == 0) {
-        ::close(fd);
-        std::vector<std::string> empty;
-        std::vector<Group> empty_groups;
-        return write_output(empty, empty_groups, out_dir) ? 0 : 1;
-    }
-    char* map = static_cast<char*>(::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0));
-    if (map == MAP_FAILED) { ::close(fd); return 1; }
-    ::madvise(map, file_size, MADV_SEQUENTIAL);
+    if (fd < 0 || fstat(fd, &st) != 0) return 1;
+    const size_t size = size_t(st.st_size);
+    const char* map = size ? static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0)) : "";
+    if (map == MAP_FAILED) return 1;
 
-    std::vector<Work> work(kThreads);
-    for (Work& w : work) {
-        w.ep_map.reserve(4096);
-        w.group_map.reserve(512);
+    // Slice boundaries sit just after a newline so no line is split.
+    const int T = thread_count();
+    std::vector<size_t> cut(T + 1, size);
+    cut[0] = 0;
+    for (int t = 1; t < T; ++t) {
+        const size_t pos = std::max(cut[t - 1], size * t / T);
+        const void* nl = std::memchr(map + pos, '\n', size - pos);
+        cut[t] = nl ? size_t(static_cast<const char*>(nl) - map) + 1 : size;
     }
-    std::vector<std::thread> threads;
-    threads.reserve(kThreads);
-    size_t lo = 0;
-    for (int t = 0; t < kThreads; ++t) {
-        size_t hi = (file_size * size_t(t + 1u)) / size_t(kThreads);
-        if (hi < file_size) while (hi < file_size && map[hi] != '\n') ++hi;
-        if (hi < file_size) ++hi;
-        if (lo < hi) threads.emplace_back(parse_slice, map, lo, hi, std::ref(work[t]));
-        lo = hi;
-    }
-    for (std::thread& t : threads) t.join();
+    std::vector<Work> work(T);
+    par(T, [&](int t) { parse_slice(map + cut[t], map + cut[t + 1], work[t]); });
 
-    std::unordered_map<std::string_view, uint32_t> all;
-    all.reserve(4096);
-    std::vector<std::vector<uint32_t>> remap(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
-        remap[t].resize(work[t].ep.size());
-        for (uint32_t i = 0; i < uint32_t(work[t].ep.size()); ++i) {
-            auto it = all.find(work[t].ep[i]);
-            if (it == all.end()) {
-                const uint32_t id = uint32_t(all.size());
-                all.emplace(work[t].ep[i], id);
-                remap[t][i] = id;
-            } else {
-                remap[t][i] = it->second;
-            }
-        }
-    }
-
+    // Rank every endpoint name once; ranks follow byte order, so (hour, rank) is the output order.
     std::vector<std::string_view> names;
-    names.reserve(all.size());
-    for (const auto& kv : all) names.push_back(kv.first);
+    for (const Work& w : work) names.insert(names.end(), w.ep.begin(), w.ep.end());
     std::sort(names.begin(), names.end());
-    std::vector<std::string> ep_names(names.size());
-    for (size_t i = 0; i < names.size(); ++i) ep_names[i].assign(names[i].data(), names[i].size());
-    std::unordered_map<std::string_view, uint32_t> rank_map;
-    rank_map.reserve(all.size());
-    for (size_t i = 0; i < names.size(); ++i) rank_map.emplace(names[i], uint32_t(i));
+    names.erase(std::unique(names.begin(), names.end()), names.end());
 
-    for (int t = 0; t < kThreads; ++t) {
-        for (uint32_t i = 0; i < uint32_t(remap[t].size()); ++i) {
-            remap[t][i] = rank_map.at(work[t].ep[i]);
-        }
-    }
-
-    struct Item { uint32_t hour, ep; size_t t, g; };
+    struct Item { uint64_t key; uint32_t t, g; };
     std::vector<Item> items;
-    size_t total_groups = 0;
-    for (int t = 0; t < kThreads; ++t) total_groups += work[t].group.size();
-    items.reserve(total_groups);
-    for (int t = 0; t < kThreads; ++t) {
-        for (size_t i = 0; i < work[t].group.size(); ++i) {
+    for (int t = 0; t < T; ++t) {
+        std::vector<uint32_t> rank;
+        for (std::string_view s : work[t].ep) rank.push_back(uint32_t(std::lower_bound(names.begin(), names.end(), s) - names.begin()));
+        for (uint32_t i = 0; i < work[t].group.size(); ++i) {
             const Group& g = work[t].group[i];
-            items.push_back(Item{g.hour, remap[t][g.ep], size_t(t), i});
+            items.push_back({uint64_t(g.hour) << 32 | rank[g.ep], uint32_t(t), i});
         }
     }
-    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
-        if (a.hour != b.hour) return a.hour < b.hour;
-        return a.ep < b.ep;
-    });
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.key < b.key; });
 
-    std::vector<Group> groups;
+    std::vector<Group> groups;  // one per (hour, endpoint), slices merged
     groups.reserve(items.size());
     for (const Item& it : items) {
-        const Group& g = work[it.t].group[it.g];
-        if (!groups.empty() && groups.back().hour == g.hour && groups.back().ep == it.ep) {
-            Group& dst = groups.back();
-            dst.count += g.count;
-            dst.errors += g.errors;
-            dst.lat.reserve(dst.lat.size() + g.lat.size());
-            dst.lat.insert(dst.lat.end(), g.lat.begin(), g.lat.end());
+        Group& g = work[it.t].group[it.g];
+        const uint32_t hour = uint32_t(it.key >> 32), ep = uint32_t(it.key);
+        if (!groups.empty() && groups.back().hour == hour && groups.back().ep == ep) {
+            Group& d = groups.back();
+            d.count += g.count;
+            d.errors += g.errors;
+            d.lat.insert(d.lat.end(), g.lat.begin(), g.lat.end());
         } else {
-            Group copy = g;
-            copy.ep = it.ep;
-            groups.push_back(copy);
+            g.hour = hour;
+            g.ep = ep;
+            groups.push_back(std::move(g));
         }
     }
 
-    std::vector<size_t> order(groups.size());
-    for (size_t i = 0; i < groups.size(); ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return groups[a].lat.size() > groups[b].lat.size();
-    });
-    std::atomic<size_t> next(0);
-    std::vector<std::thread> pct;
-    pct.reserve(kThreads);
-    for (int t = 0; t < kThreads; ++t) {
-        pct.emplace_back([&] {
-            for (;;) {
-                const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                if (i >= order.size()) return;
-                score_group(groups[order[i]]);
+    // Percentiles and formatting in one parallel pass; batches are written in order.
+    const size_t nb = (groups.size() + kBatch - 1) / kBatch;
+    std::vector<std::string> bufs(nb);
+    std::atomic<size_t> next{0};
+    par(T, [&](int) {
+        for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nb;)
+            for (size_t i = b * kBatch; i < std::min(groups.size(), (b + 1) * kBatch); ++i) {
+                score_group(groups[i]);
+                append_line(bufs[b], groups[i], names[groups[i].ep]);
             }
-        });
-    }
-    for (std::thread& t : pct) t.join();
-
-    std::sort(groups.begin(), groups.end(), [&](const Group& a, const Group& b) {
-        if (a.hour != b.hour) return a.hour < b.hour;
-        const std::string& sa = ep_names[a.ep];
-        const std::string& sb = ep_names[b.ep];
-        const size_t n = std::min(sa.size(), sb.size());
-        const int c = std::memcmp(sa.data(), sb.data(), n);
-        if (c) return c < 0;
-        return sa.size() < sb.size();
     });
-    const int ok = write_output(ep_names, groups, out_dir);
-    ::munmap(map, file_size);
-    ::close(fd);
-    if (ok) _exit(0);
-    return 1;
+
+    mkdir(out_dir, 0777);
+    const int ofd = open((std::string(out_dir) + "/summary.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (ofd < 0) return 1;
+    for (const std::string& s : bufs)
+        for (size_t o = 0; o < s.size();) {
+            const ssize_t n = write(ofd, s.data() + o, s.size() - o);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return 1;
+            o += size_t(n);
+        }
+    _exit(0);  // skip tearing down millions of small objects
 }
