@@ -12,7 +12,9 @@
 #include <fcntl.h>
 #include <sched.h>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/mman.h>
@@ -41,9 +43,11 @@ struct Group {
     std::vector<uint32_t> lat;
 };
 struct Work {
-    std::vector<Ep> ep;
+    std::vector<std::string_view> ep;
+    std::unordered_map<std::string_view, uint32_t> ep_map;
     std::vector<Group> group;
-    Group* last = nullptr;
+    std::unordered_map<uint64_t, uint32_t> group_map;
+    size_t last = size_t(-1);
 };
 
 inline uint32_t hour_key(const char* p) {
@@ -63,25 +67,25 @@ inline bool dec_u32(const char* b, const char* e, uint32_t& v) {
 }
 
 inline uint32_t add_ep(Work& w, const char* s, uint32_t len) {
-    for (uint32_t i = 0; i < w.ep.size(); ++i) {
-        const Ep& e = w.ep[i];
-        if (e.len == len && std::memcmp(e.s, s, len) == 0) return i;
-    }
-    w.ep.push_back(Ep{s, len});
-    return uint32_t(w.ep.size() - 1u);
+    std::string_view key(s, len);
+    auto it = w.ep_map.find(key);
+    if (it != w.ep_map.end()) return it->second;
+    const uint32_t id = uint32_t(w.ep.size());
+    w.ep.push_back(key);
+    w.ep_map.emplace(key, id);
+    return id;
 }
 
 inline Group* add_group(Work& w, uint32_t hour, uint32_t ep) {
-    if (w.last && w.last->hour == hour && w.last->ep == ep) return w.last;
-    for (Group& g : w.group) {
-        if (g.hour == hour && g.ep == ep) {
-            w.last = &g;
-            return &g;
-        }
-    }
-    w.group.push_back(Group{hour, ep, 0, 0, 0, 0, 0, {}});
-    w.last = &w.group.back();
-    return w.last;
+    const uint64_t key = (uint64_t(hour) << 32) | uint64_t(ep);
+    auto it = w.group_map.find(key);
+    if (it != w.group_map.end()) return &w.group[it->second];
+    if (w.last != size_t(-1) && w.group[w.last].hour == hour && w.group[w.last].ep == ep) return &w.group[w.last];
+    w.group.push_back(Group{hour, ep, 0, 0, 0, 0, {}});
+    const uint32_t idx = uint32_t(w.group.size() - 1u);
+    w.group_map.emplace(key, idx);
+    w.last = idx;
+    return &w.group[idx];
 }
 
 inline bool parse_line(const char* b, const char* e, uint32_t& hour, const char*& ep, uint32_t& ep_len, uint32_t& status, uint32_t& lat) {
@@ -191,11 +195,13 @@ inline void score_group(Group& g) {
     g.p99 = v[(99ull * n + 99ull) / 100ull - 1ull];
 }
 
-inline void emit_line(char*& p, const Group& g, const std::string& ep) {
+inline void append_line(std::string& out, const Group& g, const std::string& ep) {
     const uint32_t year = g.hour / 1000000u;
     const uint32_t month = (g.hour / 10000u) % 100u;
     const uint32_t day = (g.hour / 100u) % 100u;
     const uint32_t h = g.hour % 100u;
+    char buf[256];
+    char* p = buf;
     put4(p, year);
     *p++ = '-';
     put2(p, month);
@@ -206,18 +212,9 @@ inline void emit_line(char*& p, const Group& g, const std::string& ep) {
     std::memcpy(p, ":00:00Z ", 8); p += 8;
     std::memcpy(p, ep.data(), ep.size()); p += ep.size();
     *p++ = ' ';
-    put_num(p, g.count);
-    *p++ = ' ';
-    put_num(p, g.p50);
-    *p++ = ' ';
-    put_num(p, g.p95);
-    *p++ = ' ';
-    put_num(p, g.p99);
-    *p++ = ' ';
-    put_num(p, g.errors);
-    *p++ = ' ';
-    put_num(p, uint64_t(g.errors) * 1000000ull / g.count);
-    *p++ = '\n';
+    const uint64_t eppm = uint64_t(g.errors) * 1000000ull / g.count;
+    put_num(p, g.count); *p++ = ' '; put_num(p, g.p50); *p++ = ' '; put_num(p, g.p95); *p++ = ' '; put_num(p, g.p99); *p++ = ' '; put_num(p, g.errors); *p++ = ' '; put_num(p, eppm); *p++ = '\n';
+    out.append(buf, size_t(p - buf));
 }
 
 bool write_output(const std::vector<std::string>& ep_names, std::vector<Group>& groups, const char* out_dir) {
@@ -237,15 +234,11 @@ bool write_output(const std::vector<std::string>& ep_names, std::vector<Group>& 
         if (lo >= hi) continue;
         ts.emplace_back([&](size_t a, size_t b, size_t tid) {
             std::string& out = bufs[tid];
+            size_t cap = 0;
+            for (size_t i = a; i < b; ++i) cap += ep_names[groups[i].ep].size() + 96u;
             out.clear();
-            out.reserve((b - a) * 96u);
-            char tmp[256];
-            for (size_t i = a; i < b; ++i) {
-                const Group& g = groups[i];
-                char* p = tmp;
-                emit_line(p, g, ep_names[g.ep]);
-                out.append(tmp, size_t(p - tmp));
-            }
+            out.reserve(cap);
+            for (size_t i = a; i < b; ++i) append_line(out, groups[i], ep_names[groups[i].ep]);
         }, lo, hi, t);
     }
     for (std::thread& t : ts) t.join();
@@ -295,6 +288,10 @@ int main(int argc, char** argv) {
     ::madvise(map, file_size, MADV_SEQUENTIAL);
 
     std::vector<Work> work(kThreads);
+    for (Work& w : work) {
+        w.ep_map.reserve(4096);
+        w.group_map.reserve(512);
+    }
     std::vector<std::thread> threads;
     threads.reserve(kThreads);
     size_t lo = 0;
@@ -307,39 +304,69 @@ int main(int argc, char** argv) {
     }
     for (std::thread& t : threads) t.join();
 
-    std::vector<Ep> all;
+    std::unordered_map<std::string_view, uint32_t> all;
+    all.reserve(4096);
     std::vector<std::vector<uint32_t>> remap(kThreads);
     for (int t = 0; t < kThreads; ++t) {
         remap[t].resize(work[t].ep.size());
         for (uint32_t i = 0; i < uint32_t(work[t].ep.size()); ++i) {
-            const Ep& e = work[t].ep[i];
-            uint32_t j = 0;
-            for (; j < uint32_t(all.size()); ++j) {
-                if (all[j].len == e.len && std::memcmp(all[j].s, e.s, e.len) == 0) break;
+            auto it = all.find(work[t].ep[i]);
+            if (it == all.end()) {
+                const uint32_t id = uint32_t(all.size());
+                all.emplace(work[t].ep[i], id);
+                remap[t][i] = id;
+            } else {
+                remap[t][i] = it->second;
             }
-            if (j == uint32_t(all.size())) all.push_back(e);
-            remap[t][i] = j;
         }
     }
 
-    std::vector<std::string> ep_names(all.size());
-    for (uint32_t i = 0; i < uint32_t(all.size()); ++i) ep_names[i].assign(all[i].s, all[i].len);
+    std::vector<std::string_view> names;
+    names.reserve(all.size());
+    for (const auto& kv : all) names.push_back(kv.first);
+    std::sort(names.begin(), names.end());
+    std::vector<std::string> ep_names(names.size());
+    for (size_t i = 0; i < names.size(); ++i) ep_names[i].assign(names[i].data(), names[i].size());
+    std::unordered_map<std::string_view, uint32_t> rank_map;
+    rank_map.reserve(all.size());
+    for (size_t i = 0; i < names.size(); ++i) rank_map.emplace(names[i], uint32_t(i));
+
+    for (int t = 0; t < kThreads; ++t) {
+        for (uint32_t i = 0; i < uint32_t(remap[t].size()); ++i) {
+            remap[t][i] = rank_map.at(work[t].ep[i]);
+        }
+    }
+
+    struct Item { uint32_t hour, ep; size_t t, g; };
+    std::vector<Item> items;
+    size_t total_groups = 0;
+    for (int t = 0; t < kThreads; ++t) total_groups += work[t].group.size();
+    items.reserve(total_groups);
+    for (int t = 0; t < kThreads; ++t) {
+        for (size_t i = 0; i < work[t].group.size(); ++i) {
+            const Group& g = work[t].group[i];
+            items.push_back(Item{g.hour, remap[t][g.ep], size_t(t), i});
+        }
+    }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        if (a.hour != b.hour) return a.hour < b.hour;
+        return a.ep < b.ep;
+    });
 
     std::vector<Group> groups;
-    for (int t = 0; t < kThreads; ++t) {
-        for (const Group& g : work[t].group) {
-            const uint32_t ep = remap[t][g.ep];
-            Group* dst = nullptr;
-            for (Group& x : groups) {
-                if (x.hour == g.hour && x.ep == ep) { dst = &x; break; }
-            }
-            if (!dst) {
-                groups.push_back(Group{g.hour, ep, 0, 0, 0, 0, 0, {}});
-                dst = &groups.back();
-            }
-            dst->count += g.count;
-            dst->errors += g.errors;
-            dst->lat.insert(dst->lat.end(), g.lat.begin(), g.lat.end());
+    groups.reserve(items.size());
+    for (const Item& it : items) {
+        const Group& g = work[it.t].group[it.g];
+        if (!groups.empty() && groups.back().hour == g.hour && groups.back().ep == it.ep) {
+            Group& dst = groups.back();
+            dst.count += g.count;
+            dst.errors += g.errors;
+            dst.lat.reserve(dst.lat.size() + g.lat.size());
+            dst.lat.insert(dst.lat.end(), g.lat.begin(), g.lat.end());
+        } else {
+            Group copy = g;
+            copy.ep = it.ep;
+            groups.push_back(copy);
         }
     }
 
