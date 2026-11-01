@@ -1,22 +1,3 @@
-// Speed Demon 2026 - Track B (Index)
-//
-// Reads /data/docs.txt and /data/queries.txt, writes /out/results.txt.
-// Follows specs/b-index.md exactly:
-//   * token = maximal run of ASCII [a-z0-9] after ASCII lowercasing; every
-//     other byte (including every byte >= 0x80) is a separator
-//   * BOOL applies AND/OR/NOT strictly left to right, NOT is binary
-//   * PHRASE requires consecutive token positions inside one document
-//   * output: count, sum of ids, then min(10, count) smallest ids
-//
-// The queries are read first, so only the terms they mention are indexed:
-// document postings for every query term, token positions only for terms
-// that occur in a phrase.  Index construction is a two-pass parallel CSR
-// build (count, then fill): no per-term vectors, no reallocation, and exact
-// memory.  docs.txt is memory mapped read-only.
-//
-// Build: g++ -O3 -std=c++17 -DNDEBUG -march=native -flto -pthread -static -s
-// Run:   ./runner /data /out
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
