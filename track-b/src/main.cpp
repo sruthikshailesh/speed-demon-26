@@ -249,6 +249,30 @@ struct Query {
 
 enum : uint8_t { OP_AND = 0, OP_OR = 1, OP_NOT = 2 };
 
+std::string lowercase_query_term(const char* s, uint32_t n) {
+    std::string term(n, '\0');
+    for (uint32_t i = 0; i < n; ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        term[i] = static_cast<char>(c);
+    }
+    return term;
+}
+
+template <typename F>
+void for_each_query_token(const char* p, const char* e, F&& fn) {
+    while (p < e) {
+        while (p < e && g_tok[static_cast<unsigned char>(*p)] == 0) ++p;
+        const char* start = p;
+        while (p < e && g_tok[static_cast<unsigned char>(*p)] != 0) ++p;
+        if (p == start) continue;
+        std::string token(static_cast<size_t>(p - start), '\0');
+        for (size_t i = 0; i < token.size(); ++i)
+            token[i] = static_cast<char>(g_tok[static_cast<unsigned char>(start[i])]);
+        fn(token);
+    }
+}
+
 // Collect every distinct term the queries mention.
 void collect_query_terms(const std::string& qb, TermTable& table) {
     const char* p = qb.data();
@@ -262,7 +286,10 @@ void collect_query_terms(const std::string& qb, TermTable& table) {
             bool is_term = true;
             for (const char* r = q;; ++r) {
                 if (r == nl || *r == ' ') {
-                    if (is_term && r > q) table.insert(q, static_cast<uint32_t>(r - q));
+                    if (is_term && r > q) {
+                        std::string term = lowercase_query_term(q, static_cast<uint32_t>(r - q));
+                        table.insert(term.data(), static_cast<uint32_t>(term.size()));
+                    }
                     is_term = !is_term;
                     q = r + 1;
                     if (r == nl) break;
@@ -272,14 +299,11 @@ void collect_query_terms(const std::string& qb, TermTable& table) {
             const char* q = p + 8;
             const char* end = nl;
             if (end > q && end[-1] == '"') --end;
-            while (q < end) {
-                const char* s = q;
-                while (q < end && *q != ' ') ++q;
-                if (q > s) table.insert(s, static_cast<uint32_t>(q - s));
-                if (q < end) ++q;
-            }
+            for_each_query_token(q, end, [&](const std::string& term) {
+                table.insert(term.data(), static_cast<uint32_t>(term.size()));
+            });
         }
-        p = nl + 1;
+        p = nl < e ? nl + 1 : e;
     }
 }
 
@@ -307,12 +331,14 @@ void parse_queries(const std::string& qb, const TermTable& table, std::vector<Qu
             for (const char* r = q;; ++r) {
                 if (r == nl || *r == ' ') {
                     if (r > q) {
-                        uint32_t tid = table.find(q, static_cast<uint32_t>(r - q));
+                        uint32_t len = static_cast<uint32_t>(r - q);
                         if (is_term) {
+                            std::string term = lowercase_query_term(q, len);
+                            uint32_t tid = table.find(term.data(), len);
                             terms.push_back(tid == kNoTerm ? nterms : tid);
-                        } else if (std::memcmp(q, "AND", 3) == 0) {
+                        } else if (len == 3 && std::memcmp(q, "AND", 3) == 0) {
                             ops.push_back(OP_AND);
-                        } else if (std::memcmp(q, "OR", 2) == 0) {
+                        } else if (len == 2 && std::memcmp(q, "OR", 2) == 0) {
                             ops.push_back(OP_OR);
                         } else {
                             ops.push_back(OP_NOT);
@@ -329,22 +355,17 @@ void parse_queries(const std::string& qb, const TermTable& table, std::vector<Qu
             const char* q = p + 8;
             const char* end = nl;
             if (end > q && end[-1] == '"') --end;
-            while (q < end) {
-                const char* s = q;
-                while (q < end && *q != ' ') ++q;
-                if (q > s) {
-                    uint32_t tid = table.find(s, static_cast<uint32_t>(q - s));
-                    terms.push_back(tid == kNoTerm ? nterms : tid);
-                }
-                if (q < end) ++q;
-            }
+            for_each_query_token(q, end, [&](const std::string& term) {
+                uint32_t tid = table.find(term.data(), static_cast<uint32_t>(term.size()));
+                terms.push_back(tid == kNoTerm ? nterms : tid);
+            });
             qu.n = static_cast<uint32_t>(terms.size()) - qu.toff;
         } else {
             qu.kind = 0;
             qu.n = 0;
         }
         queries.push_back(qu);
-        p = nl + 1;
+        p = nl < e ? nl + 1 : e;
     }
     // Mark terms whose token positions are needed (anything used by a phrase).
     for (const Query& qu : queries) {
