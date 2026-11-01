@@ -307,13 +307,12 @@ void parse_queries(const std::string& qb, const TermTable& table, std::vector<Qu
             for (const char* r = q;; ++r) {
                 if (r == nl || *r == ' ') {
                     if (r > q) {
-                        uint32_t len = static_cast<uint32_t>(r - q);
+                        uint32_t tid = table.find(q, static_cast<uint32_t>(r - q));
                         if (is_term) {
-                            uint32_t tid = table.find(q, len);
                             terms.push_back(tid == kNoTerm ? nterms : tid);
-                        } else if (len == 3 && std::memcmp(q, "AND", 3) == 0) {
+                        } else if (std::memcmp(q, "AND", 3) == 0) {
                             ops.push_back(OP_AND);
-                        } else if (len == 2 && std::memcmp(q, "OR", 2) == 0) {
+                        } else if (std::memcmp(q, "OR", 2) == 0) {
                             ops.push_back(OP_OR);
                         } else {
                             ops.push_back(OP_NOT);
@@ -513,9 +512,11 @@ void build_index(const char* data, size_t size, const TermTable& table, const st
     std::vector<uint32_t> cnt_occ(static_cast<size_t>(nthreads) * N, 0);
     std::vector<uint32_t> last(static_cast<size_t>(nthreads) * N, kNoTerm);
 
-    // Pass 1 counts postings and positional occurrences. The stream stores
-    // one event per (term, doc) for non-phrase terms and every occurrence for
-    // phrase terms; document markers let pass 2 replay without rescanning text.
+    // Pass 1 tokenizes the corpus once and records, per thread, one packed
+    // (term id, position) word per query-term occurrence.  A word whose high
+    // half is kNoTerm carries the document id and starts a new document.
+    // Pass 2 replays those words to scatter the CSR arrays, so the corpus is
+    // never tokenized twice.
     const uint64_t kDocMark = static_cast<uint64_t>(kNoTerm) << 32;
     std::vector<std::vector<uint64_t>> streams(nthreads);
 
@@ -534,16 +535,12 @@ void build_index(const char* data, size_t size, const TermTable& table, const st
                     chunks[u], table,
                     [&](uint32_t doc) { stream.push_back(kDocMark | doc); },
                     [&](uint32_t tid, uint32_t doc, uint32_t pos) {
-                        const bool first_in_doc = clast[tid] != doc;
-                        if (first_in_doc) {
+                        if (clast[tid] != doc) {
                             clast[tid] = doc;
                             ++cdf[tid];
                         }
                         if (need_pos[tid]) ++cocc[tid];
-                        // Non-phrase terms need only one (term, doc) event.
-                        // Phrase terms retain every occurrence for positions.
-                        if (first_in_doc || need_pos[tid])
-                            stream.push_back((static_cast<uint64_t>(tid) << 32) | pos);
+                        stream.push_back((static_cast<uint64_t>(tid) << 32) | pos);
                         if (pos > localmax) localmax = pos;
                     });
 #ifdef SD_TIMING
@@ -736,45 +733,28 @@ void intersect_into(List a, List b, std::vector<uint32_t>& out) {
     }
 }
 
-struct MergeNode {
-    uint32_t value;
-    uint32_t list;
-    uint32_t offset;
-};
-
-// K-way merge an OR run once instead of copying the growing union after
-// every operand. The reusable heap avoids one allocation per OR query.
-void union_many_into(const List* lists, uint32_t count, std::vector<MergeNode>& heap,
-                     std::vector<uint32_t>& out) {
-    auto greater = [](const MergeNode& a, const MergeNode& b) {
-        return a.value > b.value || (a.value == b.value && a.list > b.list);
-    };
-
+void union_into(List a, List b, std::vector<uint32_t>& out) {
     out.clear();
-    size_t max_out = 0;
-    heap.clear();
-    heap.reserve(count);
-    for (uint32_t i = 0; i < count; ++i) {
-        max_out += lists[i].n;
-        if (lists[i].n != 0) {
-            heap.push_back(MergeNode{lists[i].p[0], i, 0});
-            std::push_heap(heap.begin(), heap.end(), greater);
+    out.reserve(static_cast<size_t>(a.n) + b.n);
+    uint32_t i = 0;
+    uint32_t j = 0;
+    while (i < a.n && j < b.n) {
+        uint32_t x = a.p[i];
+        uint32_t y = b.p[j];
+        if (x < y) {
+            out.push_back(x);
+            ++i;
+        } else if (y < x) {
+            out.push_back(y);
+            ++j;
+        } else {
+            out.push_back(x);
+            ++i;
+            ++j;
         }
     }
-    out.reserve(max_out);
-    while (!heap.empty()) {
-        std::pop_heap(heap.begin(), heap.end(), greater);
-        MergeNode node = heap.back();
-        heap.pop_back();
-        if (out.empty() || out.back() != node.value) out.push_back(node.value);
-
-        ++node.offset;
-        if (node.offset < lists[node.list].n) {
-            node.value = lists[node.list].p[node.offset];
-            heap.push_back(node);
-            std::push_heap(heap.begin(), heap.end(), greater);
-        }
-    }
+    while (i < a.n) out.push_back(a.p[i++]);
+    while (j < b.n) out.push_back(b.p[j++]);
 }
 
 void difference_into(List a, List b, std::vector<uint32_t>& out) {
@@ -819,15 +799,6 @@ struct ThreadCtx {
     std::vector<uint32_t> buf_b;
     std::vector<uint32_t> cand_a;
     std::vector<uint32_t> cand_b;
-    std::vector<uint32_t> phrase_matches;
-    std::vector<uint32_t> phrase_order;
-    std::vector<uint32_t> posting_cursor;
-    std::vector<uint32_t> position_cursor;
-    std::vector<uint32_t> phrase_pos_len;
-    std::vector<List> operands;
-    std::vector<List> phrase_lists;
-    std::vector<const uint32_t*> phrase_positions;
-    std::vector<MergeNode> merge_heap;
     std::string out;
 };
 
@@ -856,14 +827,9 @@ void format_result(List r, std::string& out) {
 
 void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::vector<uint8_t>& ops,
               const Index& idx, ThreadCtx& ctx, std::string& out) {
-    if (qu.n == 0) {
-        format_result(kEmptyList, out);
-        return;
-    }
     List cur = idx.list(terms[qu.toff]);
     std::vector<uint32_t>* w = &ctx.buf_a;
     std::vector<uint32_t>* w2 = &ctx.buf_b;
-    std::vector<List>& operands = ctx.operands;
     uint32_t k = 1;
     while (k < qu.n) {
         uint8_t op = ops[qu.ooff + k - 1];
@@ -882,13 +848,13 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
         }
         // A maximal run of one associative operator can be evaluated in any
         // order, so start from the smallest posting lists.
-        operands.clear();
-        operands.push_back(cur);
+        List operands[16];
+        uint32_t m = 0;
+        operands[m++] = cur;
         while (k < qu.n && ops[qu.ooff + k - 1] == op) {
-            operands.push_back(idx.list(terms[qu.toff + k]));
+            operands[m++] = idx.list(terms[qu.toff + k]);
             ++k;
         }
-        const uint32_t m = static_cast<uint32_t>(operands.size());
         for (uint32_t i = 1; i < m; ++i) {
             List v = operands[i];
             uint32_t j = i;
@@ -898,8 +864,8 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
             }
             operands[j] = v;
         }
-        // Keep a buffered accumulator among the first two operands so the
-        // alternating output buffers never overwrite an unread input.
+        // A buffered accumulator is evaluated no later than the second step, so
+        // the output rotation cannot overwrite it while it is still an operand.
         if (cur.n != 0 && (cur.p == ctx.buf_a.data() || cur.p == ctx.buf_b.data())) {
             uint32_t p = 0;
             while (p < m && operands[p].p != cur.p) ++p;
@@ -915,9 +881,17 @@ void run_bool(const Query& qu, const std::vector<uint32_t>& terms, const std::ve
                 std::swap(w, w2);
             }
         } else {
-            union_many_into(operands.data(), m, ctx.merge_heap, *w);
-            cur = List{w->data(), static_cast<uint32_t>(w->size())};
-            std::swap(w, w2);
+            for (uint32_t i = 1; i < m; ++i) {
+                List rhs = operands[i];
+                if (rhs.empty() || (cur.p == rhs.p && cur.n == rhs.n)) continue;
+                if (cur.empty()) {
+                    cur = rhs;
+                    continue;
+                }
+                union_into(cur, rhs, *w);
+                cur = List{w->data(), static_cast<uint32_t>(w->size())};
+                std::swap(w, w2);
+            }
         }
     }
     format_result(cur, out);
@@ -934,10 +908,8 @@ void run_phrase(const Query& qu, const std::vector<uint32_t>& terms, const Index
         return;
     }
     const uint32_t* qt = terms.data() + qu.toff;
-    std::vector<List>& ql = ctx.phrase_lists;
-    std::vector<uint32_t>& order = ctx.phrase_order;
-    ql.resize(n);
-    order.resize(n);
+    List ql[16];
+    uint32_t order[16];
     uint32_t j = 0;
     uint32_t best = UINT32_MAX;
     for (uint32_t o = 0; o < n; ++o) {
@@ -983,34 +955,25 @@ void run_phrase(const Query& qu, const std::vector<uint32_t>& terms, const Index
     g_phrase_cand.fetch_add(cur.n, std::memory_order_relaxed);
 #endif
 
-    // Candidate docs are sorted and already occur in every posting list.
-    // Advance cursors instead of binary-searching for each candidate.
-    std::vector<const uint32_t*>& sl = ctx.phrase_positions;
-    std::vector<uint32_t>& sln = ctx.phrase_pos_len;
-    std::vector<uint32_t>& post_cursor = ctx.posting_cursor;
-    std::vector<uint32_t>& pos_cursor = ctx.position_cursor;
-    sl.resize(n);
-    sln.resize(n);
-    post_cursor.assign(n, 0);
-    std::vector<uint32_t>& matches = ctx.phrase_matches;
-    matches.clear();
+    // Positional verification.
+    const uint32_t* sl[16];
+    uint32_t sln[16];
+    std::vector<uint32_t> matches;
     matches.reserve(cur.n);
     for (uint32_t ci = 0; ci < cur.n; ++ci) {
         uint32_t doc = cur.p[ci];
         bool present = true;
         for (uint32_t o = 0; o < n; ++o) {
-            uint32_t& pi = post_cursor[o];
-            while (pi < ql[o].n && ql[o].p[pi] < doc) ++pi;
-            if (pi == ql[o].n || ql[o].p[pi] != doc) {
+            const uint32_t* end = ql[o].p + ql[o].n;
+            const uint32_t* hit = std::lower_bound(ql[o].p, end, doc);
+            if (hit == end || *hit != doc) {
                 present = false;
                 break;
             }
-            idx.positions(qt[o], pi, sl[o], sln[o]);
+            idx.positions(qt[o], static_cast<uint32_t>(hit - ql[o].p), sl[o], sln[o]);
         }
         if (!present) continue;
-
         bool found = false;
-        pos_cursor.assign(n, 0);
         for (uint32_t pi = 0; pi < sln[j]; ++pi) {
             uint32_t p = sl[j][pi];
             if (p < j) continue;
@@ -1019,9 +982,7 @@ void run_phrase(const Query& qu, const std::vector<uint32_t>& terms, const Index
             for (uint32_t o = 0; o < n; ++o) {
                 if (o == j) continue;
                 uint32_t need = start + o;
-                uint32_t& cursor = pos_cursor[o];
-                while (cursor < sln[o] && sl[o][cursor] < need) ++cursor;
-                if (cursor == sln[o] || sl[o][cursor] != need) {
+                if (!std::binary_search(sl[o], sl[o] + sln[o], need)) {
                     ok = false;
                     break;
                 }
