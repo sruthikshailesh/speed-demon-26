@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <sys/mman.h>
@@ -307,28 +308,36 @@ int main(int argc, char** argv) {
     for (std::thread& t : threads) t.join();
 
     std::vector<Ep> all;
+    std::unordered_map<std::string, uint32_t> seen;
     std::vector<std::vector<uint32_t>> remap(kThreads);
     for (int t = 0; t < kThreads; ++t) {
         remap[t].resize(work[t].eps.size());
         for (uint32_t i = 0; i < uint32_t(work[t].eps.size()); ++i) {
             const Ep& e = work[t].eps[i];
-            uint32_t j = 0;
-            for (; j < uint32_t(all.size()); ++j) {
-                const Ep& x = all[j];
-                if (x.len == e.len && std::memcmp(x.s.data(), e.s.data(), e.len) == 0) break;
+            auto it = seen.find(e.s);
+            if (it == seen.end()) {
+                const uint32_t idx = uint32_t(all.size());
+                seen.emplace(e.s, idx);
+                all.push_back(e);
+                remap[t][i] = idx;
+            } else {
+                remap[t][i] = it->second;
             }
-            if (j == uint32_t(all.size())) all.push_back(e);
-            remap[t][i] = j;
         }
     }
 
     std::vector<std::string> ep_names(all.size());
     for (uint32_t i = 0; i < uint32_t(all.size()); ++i) ep_names[i] = all[i].s;
+    std::sort(ep_names.begin(), ep_names.end());
+    std::unordered_map<std::string, uint32_t> rank;
+    rank.reserve(ep_names.size());
+    for (uint32_t i = 0; i < uint32_t(ep_names.size()); ++i) rank.emplace(ep_names[i], i);
 
     std::vector<Group> groups;
     for (int t = 0; t < kThreads; ++t) {
         for (Group& g : work[t].groups) {
-            groups.push_back(Group{g.hour, remap[t][g.ep], g.count, g.errors, 0, 0, 0, std::move(g.lat)});
+            const std::string& name = all[remap[t][g.ep]].s;
+            groups.push_back(Group{g.hour, rank[name], g.count, g.errors, 0, 0, 0, std::move(g.lat)});
         }
     }
     std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
