@@ -7,6 +7,15 @@
 //   * BOOL applies AND/OR/NOT strictly left to right; NOT is binary.
 //   * PHRASE requires consecutive token positions within a single document.
 //   * Output: <count> <sum_of_ids> [<up to 10 smallest doc ids>]\n
+//
+// Build:
+//   * macOS / Linux local dev:
+//       g++ -O3 -std=c++17 -DNDEBUG -march=native -flto -pthread runner.cpp -o runner
+//   * Competition server (Linux static):
+//       g++ -O3 -std=c++17 -DNDEBUG -march=native -flto -pthread -static -s runner.cpp -o runner
+//     (Note: '-static' causes 'crt0.o not found' on macOS because Apple Clang does not support static linking)
+//
+// Run:   ./runner /data /out
 
 #include <algorithm>
 #include <atomic>
