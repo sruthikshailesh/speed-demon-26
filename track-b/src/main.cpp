@@ -1,6 +1,5 @@
 // Speed Demon 2026 - Track B (Index)
 // High-Performance Parallel Inverted Index & Query Engine
-// Author: Speed Demon Performance Engineering Team
 //
 // Complies with specs/b-index.md:
 //   * Token: maximal run of ASCII [a-z0-9] after ASCII lowercasing; every
@@ -396,36 +395,25 @@ inline void scan_chunk(const Chunk& c, const TermTable& table, bool long_terms,
         const char* q = tab ? tab + 1 : nl;
         uint32_t pos = 0;
         while (q < nl) {
-            unsigned char ch = static_cast<unsigned char>(*q);
-            unsigned char lc = g_tok[ch];
-            if (!lc) {
-                ++q;
-                continue;
-            }
+            while (q < nl && !g_tok[static_cast<unsigned char>(*q)]) ++q;
+            if (q >= nl) break;
             const char* ts = q;
-            char buf[kMaxTermLen];
-            uint32_t n = 0;
-            do {
-                if (n < kMaxTermLen) buf[n] = static_cast<char>(lc);
-                ++n;
-                ++q;
-                if (q < nl) {
-                    ch = static_cast<unsigned char>(*q);
-                    lc = g_tok[ch];
-                } else {
-                    lc = 0;
-                }
-            } while (lc);
+            while (q < nl && g_tok[static_cast<unsigned char>(*q)]) ++q;
+            uint32_t n = static_cast<uint32_t>(q - ts);
 
             if (n >= min_tlen && n <= max_tlen) {
                 if (n <= kMaxTermLen) {
+                    char buf[kMaxTermLen];
+                    for (uint32_t i = 0; i < n; ++i)
+                        buf[i] = static_cast<char>(g_tok[static_cast<unsigned char>(ts[i])]);
                     uint64_t h = hash_bytes(buf, n);
                     uint32_t tid = table.find_h(buf, n, h);
                     if (tid != kNoTerm) on_token(tid, doc, pos);
                 } else if (long_terms) {
                     thread_local std::string long_tok;
                     long_tok.resize(n);
-                    for (uint32_t i = 0; i < n; ++i) long_tok[i] = static_cast<char>(g_tok[static_cast<unsigned char>(ts[i])]);
+                    for (uint32_t i = 0; i < n; ++i)
+                        long_tok[i] = static_cast<char>(g_tok[static_cast<unsigned char>(ts[i])]);
                     uint64_t h = hash_bytes(long_tok.data(), n);
                     uint32_t tid = table.find_h(long_tok.data(), n, h);
                     if (tid != kNoTerm) on_token(tid, doc, pos);
