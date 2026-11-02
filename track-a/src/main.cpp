@@ -18,8 +18,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 namespace {
+constexpr uint32_t kEndpointLimit = 1842, kHourCount = 72;
 constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
 constexpr size_t kBatch = 2048;  // groups per output batch
+
 struct Group {
     uint32_t hour, ep, count = 0, errors = 0, p50 = 0, p95 = 0, p99 = 0;
     std::vector<uint32_t> lat;
@@ -28,7 +30,7 @@ struct Work {  // one per thread; hash slots hold index + 1, 0 means empty
     std::vector<std::string_view> ep;  // endpoint names, views into the mapping
     std::vector<uint64_t> eh;          // their hashes
     std::vector<Group> group;
-    std::vector<uint32_t> es = std::vector<uint32_t>(2048), gs = std::vector<uint32_t>(4096);
+    std::vector<uint32_t> es = std::vector<uint32_t>(2048), gs = std::vector<uint32_t>(kEndpointLimit * kHourCount);
     size_t last = 0;                   // most recently used group
 };
 int thread_count() {
@@ -51,7 +53,6 @@ inline uint64_t hash_bytes(const char* s, size_t n) {  // length + first and las
     uint64_t h = ((first ^ n * kMul) * kMul ^ last) * kMul;
     return h ^ (h >> 32);
 }
-inline size_t group_hash(uint32_t hour, uint32_t ep) { return size_t(((uint64_t(hour) << 32 | ep) * kMul) >> 32); }
 template <class H> void grow(std::vector<uint32_t>& s, size_t n, H hash) {
     std::vector<uint32_t> t(s.size() * 2);
     for (size_t i = 0; i < n; ++i) {
@@ -74,18 +75,12 @@ uint32_t add_ep(Work& w, std::string_view s) {
     return uint32_t(w.ep.size() - 1);
 }
 Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
-    const size_t m = w.gs.size() - 1;
-    size_t j = group_hash(hour, ep) & m;
-    for (; w.gs[j]; j = (j + 1) & m) {
-        Group& g = w.group[w.gs[j] - 1];
-        if (g.hour == hour && g.ep == ep) { w.last = w.gs[j] - 1; return g; }
-    }
+    const size_t j = size_t(hour) * kEndpointLimit + ep;
+    if (w.gs[j]) { w.last = w.gs[j] - 1; return w.group[w.last]; }
     w.group.push_back(Group{hour, ep});
     w.group.back().lat.reserve(8);  // most groups need a handful of samples; skips 3 regrowths
     w.last = w.group.size() - 1;
     w.gs[j] = uint32_t(w.group.size());
-    if (w.group.size() * 2 > w.gs.size())
-        grow(w.gs, w.group.size(), [&](size_t i) { return group_hash(w.group[i].hour, w.group[i].ep); });
     return w.group.back();
 }
 inline uint32_t hour_key(const char* p) {  // Fixed 72-hour spec span -> [0,72).
