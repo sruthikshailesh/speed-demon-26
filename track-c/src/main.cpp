@@ -23,7 +23,6 @@
 // (measured 0.886x wall, PERF.md §6.4).
 //
 // Build: g++ -O3 -std=c++17 -DNDEBUG -flto -pthread -static -s -o solution src/main.cpp
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -34,17 +33,13 @@
 #include <string>
 #include <thread>
 #include <vector>
-
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 namespace {
-
 constexpr uint32_t kNoCountry = 0xFFFF;
 constexpr uint32_t kThreads = 8;         // measured knee in PERF.md
-
 // Shared name table. 2^18 slots, 70% max load => 183500 names; the dataset has
 // 100520, and both caps below are loud failures rather than silent corruption.
 constexpr uint32_t kShift = 18;
@@ -58,7 +53,6 @@ constexpr uint32_t kMaxBlocks = 64;      // 64 MiB arena cap
 constexpr uint32_t kNotFound = 0xFFFFFFFFu;
 constexpr uint32_t kSeenWords = (kNameCap + 63) / 64;
 uint64_t* g_seen = nullptr;  // shared (ncountry+1) x kSeenWords bitset
-
 // POD slot so static zero-init is guaranteed; h is touched with __atomic and is
 // stored last (release) so a reader that observes it also sees the rest. 16 bytes
 // puts four slots on a cache line and cuts the table footprint to ~1.6 MB of
@@ -68,18 +62,15 @@ struct Slot {
     uint32_t off;    // arena offset
     uint32_t idlen;  // name id in bits 0..17, byte length in bits 18..31
 };
-
 alignas(64) Slot g_tab[kNameSlots];
 char* g_block[kMaxBlocks];
 uint32_t g_used = 0;    // arena bytes used, block-aligned
 uint32_t g_count = 0;   // names interned; also the next id
 int g_spin = 0;
-
 [[noreturn]] void overflow(const char* what) {
     std::fprintf(stderr, "name table overflow: %s\n", what);
     std::exit(1);
 }
-
 inline uint64_t fnv(const char* s, size_t n) {
     // First and last 8 bytes plus the length, not a multiply per byte: FNV-1a
     // is a 4-cycle dependency chain per byte and the name hash is on every
@@ -100,11 +91,9 @@ inline uint64_t fnv(const char* s, size_t n) {
     h ^= h >> 32;
     return h ? h : 1;
 }
-
 inline const char* name_str(uint32_t off) {
     return g_block[off >> kBlockShift] + (off & kBlockMask);
 }
-
 // Lock-free probe: acquire loads only, terminates because slots are never
 // cleared and the table is never rehashed.
 inline uint32_t name_lookup(uint64_t h, const char* s, uint32_t n) {
@@ -118,11 +107,9 @@ inline uint32_t name_lookup(uint64_t h, const char* s, uint32_t n) {
         i = (i + 1) & kSlotMask;
     }
 }
-
 uint32_t name_intern_h(uint64_t h, const char* s, uint32_t n) {
     uint32_t id = name_lookup(h, s, n);
     if (id != kNotFound) return id;
-
     // Spinlock, not std::mutex: an insert is a few dozen instructions, but the
     // futex path costs a sleeping thread a full wake-up when two threads insert
     // at once. Spin+yield measured 8% faster end to end (PERF.md).
@@ -157,9 +144,7 @@ uint32_t name_intern_h(uint64_t h, const char* s, uint32_t n) {
     __atomic_store_n(&g_tab[i].h, h, __ATOMIC_RELEASE);
     return g_count++;
 }
-
 // ---------------------------------------------------------------- per-thread state
-
 struct Acc {
     int64_t count = 0, id_sum = 0, amount_sum = 0;
     int64_t amount_min = 0, amount_max = 0;
@@ -180,7 +165,6 @@ struct Job {
     std::vector<Acc> acc;
     std::vector<char> tmp;        // unescape scratch
 };
-
 // Drain the batch: the probes are independent of each other, so their table
 // misses overlap, and so do the bitmap ORs. Same table, same lock, same result.
 void flush_pending(Job& j) {
@@ -197,16 +181,13 @@ void flush_pending(Job& j) {
                           1ull << (ids[k] & 63), __ATOMIC_RELAXED);
     j.npend = 0;
 }
-
 // ---------------------------------------------------------------- CSV record
-
 // 0x80 in every byte of w that holds '"'. Shared by find_quote/count_quotes.
 inline uint64_t quote_bits(uint64_t w) {
     const uint64_t x = w ^ 0x2222222222222222ull;
     const uint64_t v = x & 0x7F7F7F7F7F7F7F7Full;
     return ~((v + 0x7F7F7F7F7F7F7F7Full) | x) & 0x8080808080808080ull;
 }
-
 // First '"' in [p, end), or nullptr. Fields are short, so an 8-byte SWAR probe
 // beats a memchr call per quoted field (measured in PERF.md).
 inline const char* find_quote(const char* p, const char* end) {
@@ -220,7 +201,6 @@ inline const char* find_quote(const char* p, const char* end) {
     while (p < end && *p != '"') ++p;
     return p < end ? p : nullptr;
 }
-
 inline uint64_t count_quotes_span(const char* p, const char* end) {
     uint64_t n = 0;
     while (p + 8 <= end) {
@@ -232,7 +212,6 @@ inline uint64_t count_quotes_span(const char* p, const char* end) {
     while (p < end) n += (*p++ == '"');
     return n;
 }
-
 // Number of leading ASCII digits in an 8-byte little-endian window.
 inline uint32_t ndigits(uint64_t w) {
     const uint64_t x = w ^ 0x3030303030303030ull;
@@ -240,7 +219,6 @@ inline uint32_t ndigits(uint64_t w) {
     const uint64_t m = t & 0x8080808080808080ull;
     return m ? static_cast<uint32_t>(__builtin_ctzll(m)) >> 3 : 8;
 }
-
 // Value of the first nd (<= 8) ASCII digits of w (little-endian window). The
 // digits are pushed into the high bytes so the multiply chain puts each on its
 // 10^(7-i) place; bytes past nd shift out. Unit-tested in bench/digits_test.cpp.
@@ -251,7 +229,6 @@ inline uint64_t digits8(uint64_t w, uint32_t nd) {
     v = (v & 0x00FF00FF00FF00FFull) * 6553601ull >> 16;
     return ((v & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
 }
-
 // Parses the ASCII digits at p into v, returns the first non-digit. The 8-byte
 // window replaces a serial v = v*10 + d chain (~3 cycles per digit, measured in
 // PERF.md); 8+ digit fields fall back to the loop.
@@ -265,7 +242,6 @@ inline const char* parse_u64(const char* p, const char* end, uint64_t& v) {
     while (p < end && *p >= '0' && *p <= '9') v = v * 10 + static_cast<uint64_t>(*p++ - '0');
     return p;
 }
-
 // Scans one CSV field at p (quoted or plain) and leaves p on the delimiter.
 // Reports the unescaped length and the number of "" pairs; false if the buffer
 // ends inside the field.
@@ -286,7 +262,6 @@ inline bool scan_field(const char*& p, const char* end, const char*& start, uint
     len = static_cast<uint32_t>(p - start);
     return p < end;
 }
-
 // Returns pointer past the record terminator, or nullptr if the record is
 // incomplete in this buffer. `eof` allows a final record without newline.
 const char* parse_record(Job& j, const char* p, const char* end, bool eof) {
@@ -370,9 +345,7 @@ const char* parse_record(Job& j, const char* p, const char* end, bool eof) {
     }
     return p;
 }
-
 // ---------------------------------------------------------------- I/O + ranges
-
 // First record boundary at/after `from`: a '\n' at even quote parity, with the
 // parity carried in from the caller. Runs until the next terminator, so it is
 // typically a few hundred bytes of work.
@@ -388,7 +361,6 @@ off_t find_boundary(const char* base, off_t from, int parity, off_t size) {
     }
     return size;
 }
-
 void parse_range(Job& j, const char* p, const char* end, bool eof) {
     while (p < end) {
         const char* next = parse_record(j, p, end, eof);
@@ -397,15 +369,12 @@ void parse_range(Job& j, const char* p, const char* end, bool eof) {
     }
     flush_pending(j);
 }
-
-// ---------------------------------------------------------------- regions
-
+// ---------------------------------------------------------------- region
 struct Regions {
     std::vector<std::string> codes;   // country code per id
     std::vector<uint32_t> row_country;
     std::vector<uint32_t> ids;
 };
-
 bool load_regions(const char* path, Regions& R) {
     int fd = ::open(path, O_RDONLY);
     if (fd < 0) return false;
@@ -419,13 +388,11 @@ bool load_regions(const char* path, Regions& R) {
         got += static_cast<size_t>(n);
     }
     ::close(fd);
-
     const char* p = buf.data();
     const char* end = p + buf.size();
     const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
     if (!nl) return false;
     p = nl + 1;
-
     // 3-byte country code -> id, open addressing over a small table
     constexpr size_t kSlots = 4096;
     std::vector<uint32_t> key(kSlots, 0);   // code | 1<<24 marks used
@@ -461,9 +428,7 @@ bool load_regions(const char* path, Regions& R) {
     }
     return !R.codes.empty();
 }
-
 // ---------------------------------------------------------------- threads
-
 template <class F>
 void parallel(uint32_t n, F&& f) {
     std::vector<std::thread> ts;
@@ -472,9 +437,7 @@ void parallel(uint32_t n, F&& f) {
     f(0);
     for (std::thread& t : ts) t.join();
 }
-
 // ---------------------------------------------------------------- output
-
 char* put_u64(char* o, uint64_t v) {
     char t[24];
     int n = 0;
@@ -482,7 +445,6 @@ char* put_u64(char* o, uint64_t v) {
     while (n) *o++ = t[--n];
     return o;
 }
-
 char* put_cents(char* o, int64_t c) {
     uint64_t u = c < 0 ? static_cast<uint64_t>(-c) : static_cast<uint64_t>(c);
     if (c < 0) *o++ = '-';
@@ -493,9 +455,7 @@ char* put_cents(char* o, int64_t c) {
     *o++ = static_cast<char>('0' + f % 10);
     return o;
 }
-
 }  // namespace
-
 int main(int argc, char** argv) {
     const char* data = "/data";
     const char* out = "/out";
@@ -560,7 +520,6 @@ int main(int argc, char** argv) {
         jobs[i].start = rstart[i];
         jobs[i].stop = rstop[i];
     }
-
     std::vector<int> par(nt, 0);
     for (uint32_t i = 1; i < nt; ++i) par[i] = par[i - 1] ^ static_cast<int>(q[i - 1] & 1);
 
@@ -580,7 +539,6 @@ int main(int argc, char** argv) {
     for (uint32_t i = 0; i + 1 < nt; ++i)
         jobs[i].stop = std::max(jobs[i].start, jobs[i + 1].start);
     jobs[nt - 1].stop = size;
-
     // Phase 3: parse. Accumulators are per thread; names go to the one shared table.
     parallel(nt, [&](uint32_t i) {
         if (jobs[i].start < jobs[i].stop || jobs[i].is_last)
@@ -588,7 +546,6 @@ int main(int argc, char** argv) {
     });
     ::munmap(const_cast<char*>(base), static_cast<size_t>(size));
     ::close(fd);
-
     // Phase 4: sum the scalars, then count bits in the shared per-country bitmap.
     std::vector<uint32_t> distinct(ncountry + 1, 0);
     std::vector<Acc> total(ncountry + 1);
@@ -616,7 +573,6 @@ int main(int argc, char** argv) {
             distinct[c] = static_cast<uint32_t>(bits);
         }
     });
-
     // Phase 5: write, sorted bytewise.
     std::vector<uint32_t> order;
     for (uint32_t i = 0; i <= ncountry; ++i)
