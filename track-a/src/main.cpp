@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -23,15 +24,17 @@ constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
 constexpr size_t kBatch = 2048;  // groups per output batch
 
 struct Group {
-    uint32_t hour, ep, count = 0, errors = 0, p50 = 0, p95 = 0, p99 = 0;
-    std::vector<uint32_t> lat;
+    uint32_t hour, ep, count = 0, errors = 0, p50 = 0, p95 = 0, p99 = 0, off = 0, cap = 0;
 };
 struct Work {  // one per thread; hash slots hold index + 1, 0 means empty
     std::vector<std::string_view> ep;  // endpoint names, views into the mapping
     std::vector<uint64_t> eh;          // their hashes
     std::vector<Group> group;
     std::vector<uint32_t> es = std::vector<uint32_t>(2048), gs = std::vector<uint32_t>(kEndpointLimit * kHourCount);
+    size_t used = 0, capacity = 0;
+    std::unique_ptr<uint32_t[]> samples;
     size_t last = 0;                   // most recently used group
+    explicit Work(size_t bytes = 0) : capacity(bytes / 10 + 1), samples(new uint32_t[capacity]) {}
 };
 int thread_count() {
     unsigned n = std::thread::hardware_concurrency();
@@ -78,10 +81,27 @@ Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
     const size_t j = size_t(hour) * kEndpointLimit + ep;
     if (w.gs[j]) { w.last = w.gs[j] - 1; return w.group[w.last]; }
     w.group.push_back(Group{hour, ep});
-    w.group.back().lat.reserve(8);  // most groups need a handful of samples; skips 3 regrowths
     w.last = w.group.size() - 1;
     w.gs[j] = uint32_t(w.group.size());
     return w.group.back();
+}
+void add_sample(Work& w, Group& g, uint32_t value) {
+    if (g.count == g.cap) {
+        const uint32_t cap = g.cap ? g.cap * 2 : 1;
+        if (w.used + cap > w.capacity) {
+            size_t n = std::max(w.capacity * 2, w.used + cap);
+            std::unique_ptr<uint32_t[]> p(new uint32_t[n]);
+            std::memcpy(p.get(), w.samples.get(), w.used * sizeof(uint32_t));
+            w.samples = std::move(p);
+            w.capacity = n;
+        }
+        if (g.count) std::memcpy(w.samples.get() + w.used, w.samples.get() + g.off, size_t(g.count) * sizeof(uint32_t));
+        g.off = uint32_t(w.used);
+        g.cap = cap;
+        w.used += cap;
+    }
+    w.samples[g.off + g.count] = value;
+    ++g.count;
 }
 inline uint32_t hour_key(const char* p) {  // Fixed 72-hour spec span -> [0,72).
     const uint32_t month = uint32_t(p[5] - '0') * 10 + uint32_t(p[6] - '0');
@@ -114,20 +134,19 @@ void parse_slice(const char* p, const char* end, Work& w) {
         const uint32_t id = add_ep(w, std::string_view(ep, size_t(q - ep)));
         Group* g = w.group.empty() ? nullptr : &w.group[w.last];
         if (!g || g->hour != hour || g->ep != id) g = &add_group(w, hour, id);
-        ++g->count;
         g->errors += error;
-        g->lat.push_back(lat);
+        add_sample(w, *g, lat);
     }
 }
-void score_group(Group& g) {  // nearest rank: ceil(p*n/100), 1-based
-    std::vector<uint32_t>& v = g.lat;
-    const size_t n = v.size();
+void score_group(Group& g, uint32_t* samples) {  // nearest rank: ceil(p*n/100), 1-based
+    uint32_t* p = samples + g.off;
+    const size_t n = g.count;
     const size_t r[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1, (99 * n + 99) / 100 - 1};
     uint32_t* out[3] = {&g.p50, &g.p95, &g.p99};
-    if (n <= 32) std::sort(v.begin(), v.end());
+    if (n <= 32) std::sort(p, p + n);
     for (int k = 0, lo = 0; k < 3; ++k) {  // each selection only has to look right of the previous one
-        if (n > 32) std::nth_element(v.begin() + lo, v.begin() + r[k], v.end());
-        *out[k] = v[r[k]];
+        if (n > 32) std::nth_element(p + lo, p + r[k], p + n);
+        *out[k] = p[r[k]];
         lo = int(r[k]);
     }
 }
@@ -137,9 +156,9 @@ inline void put(char*& p, uint64_t v, int width = 0) {
     do { t[n++] = char('0' + v % 10); v /= 10; } while (v || n < width);
     while (n) *p++ = t[--n];
 }
-void append_line(std::string& out, const Group& g, std::string_view ep) {
+void append_line(std::string& out, const Group& g, uint32_t hour_slot, std::string_view ep) {
     char b[128], *p = b;
-    const uint32_t d = g.hour + 18, day = d / 24, hour = d % 24;
+    const uint32_t d = hour_slot + 18, day = d / 24, hour = d % 24;
     static constexpr uint8_t md[4][2] = {{10, 30}, {10, 31}, {11, 1}, {11, 2}};
     put(p, 2026, 4); *p++ = '-'; put(p, md[day][0], 2); *p++ = '-'; put(p, md[day][1], 2); *p++ = 'T'; put(p, hour, 2);
     std::memcpy(p, ":00:00Z ", 8); p += 8;
@@ -173,7 +192,9 @@ int main(int argc, char** argv) {
         const void* nl = std::memchr(map + pos, '\n', size - pos);
         cut[t] = nl ? size_t(static_cast<const char*>(nl) - map) + 1 : size;
     }
-    std::vector<Work> work(T);
+    std::vector<Work> work;
+    work.reserve(T);
+    for (int t = 0; t < T; ++t) work.emplace_back(cut[t + 1] - cut[t]);
     par(T, [&](int t) { parse_slice(map + cut[t], map + cut[t + 1], work[t]); });
     // Endpoint ranks give the required byte order; the hour/endpoint domain is small and dense.
     std::vector<std::string_view> names;
@@ -182,20 +203,31 @@ int main(int argc, char** argv) {
     names.erase(std::unique(names.begin(), names.end()), names.end());
     const size_t E = names.size(), K = size_t(72) * E;
     std::vector<Group> groups(K);
+    std::vector<uint32_t> rank_cursor(K);
+    std::vector<std::vector<uint32_t>> ranks(T);
     for (int t = 0; t < T; ++t) {
         std::vector<uint32_t> rank;
         rank.reserve(work[t].ep.size());
         for (std::string_view s : work[t].ep) rank.push_back(uint32_t(std::lower_bound(names.begin(), names.end(), s) - names.begin()));
+        ranks[t] = std::move(rank);
         for (Group& g : work[t].group) {
-            Group& d = groups[size_t(g.hour) * E + rank[g.ep]];
-            if (!d.count) {
-                g.ep = rank[g.ep];
-                d = std::move(g);
-            } else {
-                d.count += g.count;
-                d.errors += g.errors;
-                d.lat.insert(d.lat.end(), g.lat.begin(), g.lat.end());
-            }
+            Group& d = groups[size_t(g.hour) * E + ranks[t][g.ep]];
+            d.count += g.count;
+            d.errors += g.errors;
+        }
+    }
+    size_t total = 0;
+    for (size_t i = 0; i < K; ++i) {
+        groups[i].off = uint32_t(total);
+        rank_cursor[i] = groups[i].off;
+        total += groups[i].count;
+    }
+    std::unique_ptr<uint32_t[]> samples(new uint32_t[total]);
+    for (int t = 0; t < T; ++t) {
+        for (const Group& g : work[t].group) {
+            const size_t i = size_t(g.hour) * E + ranks[t][g.ep];
+            std::memcpy(samples.get() + rank_cursor[i], work[t].samples.get() + g.off, size_t(g.count) * sizeof(uint32_t));
+            rank_cursor[i] += g.count;
         }
     }
     // Select exact nearest ranks and format populated keys in parallel batches.
@@ -206,8 +238,8 @@ int main(int argc, char** argv) {
         for (size_t b; (b = next.fetch_add(1, std::memory_order_relaxed)) < nb;)
             for (size_t i = b * kBatch; i < std::min(K, (b + 1) * kBatch); ++i) {
                 if (!groups[i].count) continue;
-                score_group(groups[i]);
-                append_line(bufs[b], groups[i], names[i % E]);
+                score_group(groups[i], samples.get());
+                append_line(bufs[b], groups[i], uint32_t(i / E), names[i % E]);
             }
     });
     mkdir(out_dir, 0777);
