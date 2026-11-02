@@ -54,17 +54,11 @@ template <class F> void par(int n, F f) {
     for (std::thread& t : ts) t.join();
 }
 
-inline uint64_t hash_bytes(const char* s, size_t n) {
-    uint64_t h = n * kMul;
-    for (; n >= 8; s += 8, n -= 8) {
-        uint64_t k;
-        std::memcpy(&k, s, 8);
-        h = (h ^ k) * kMul;
-        h ^= h >> 32;
-    }
-    uint64_t k = 0;
-    std::memcpy(&k, s, n);
-    h = (h ^ k) * kMul;
+inline uint64_t hash_bytes(const char* s, size_t n) {  // length + first and last 8 bytes; equality is still a full compare
+    uint64_t first = 0, last = 0;
+    if (n >= 8) { std::memcpy(&first, s, 8); std::memcpy(&last, s + n - 8, 8); }
+    else std::memcpy(&first, s, n);
+    uint64_t h = ((first ^ n * kMul) * kMul ^ last) * kMul;
     return h ^ (h >> 32);
 }
 
@@ -101,6 +95,7 @@ Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
         if (g.hour == hour && g.ep == ep) { w.last = w.gs[j] - 1; return g; }
     }
     w.group.push_back(Group{hour, ep});
+    w.group.back().lat.reserve(8);  // most groups need a handful of samples; skips 3 regrowths
     w.last = w.group.size() - 1;
     w.gs[j] = uint32_t(w.group.size());
     if (w.group.size() * 2 > w.gs.size())
