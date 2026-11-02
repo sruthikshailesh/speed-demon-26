@@ -1,164 +1,665 @@
-# Track D performance notes
+# Track D — Performance Optimization Journey
 
-## Measurement conditions
+## 1. Overview
 
-All timings here are from the provided seed-1 full graph and query set, with
-byte-identical output hash `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`.
-Measurements ran locally on macOS ARM64 with Apple Clang 21.0.0. This is not the
-judging host (an Intel i5-13500), and the local machine's CPU model was not
-available. Treat these as comparisons between variants on this host, not as
-predictions of official T or M.
+**Track:** D — Traverse  
+**Language:** C++  
+**Build configuration:** Source code provided; exact compiler flags should be recorded from the final build.  
+**Input files:** `graph.txt`, `queries.txt`  
+**Output file:** `distances.txt`
 
-Phase times are monotonic-clock instrumentation in milliseconds. `parse`
-includes input mapping, token parsing, and degree counting; `CSR` includes
-prefix sums and edge placement; `BFS` is the locality reorder; `queries` is
-shortest-path processing; `output` includes decimal formatting and writing.
-RSS is process peak resident memory in MiB from macOS `ru_maxrss`. Instrumented
-phase runs and uninstrumented RSS runs are identified separately. Values shown
-as `—` were not collected; they are not estimates. Single-run phase values are
-noisy, and instrumentation adds a small amount of overhead.
+### Objective
 
-## Correct baseline and CSR builder comparison
+Compute exact directed shortest-path distances for the supplied source-target queries.
 
-| Variant | Workers | Parse | CSR | BFS | Queries | Output | Total | Peak RSS | Result |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| Sequential CSR + `std::priority_queue` baseline, phase medians across 5 runs | 1 | 86.4 | 101.5 | — | 5,842.4 | 0.3 | 6,003.0 | 168.9 | Correct baseline; too slow |
-| Direct parallel two-pass CSR, one instrumented run | 12 | 26.0 | 28.5 | — | 697.6 | ~0.3 | 752.4 | 307.8 | Correct and fast over baseline; higher parse/build cost than buffered buckets |
-| Buffered per-worker edge buckets + CSR, v12 phase medians across 3 runs | 1 | 70.3 | 35.8 | 75.6 | 870.7 | ~0.2 | 1,052.6 | 222.2 | Kept as the basis for the optimized path |
-| Same v12 implementation | 2 | 36.8 | 20.5 | 50.0 | 445.2 | ~0.2 | 552.9 | 267.1 | — |
-| Same v12 implementation | 4 | 26.0 | 14.7 | 41.6 | 241.8 | ~0.1 | 324.2 | 281.1 | — |
-| Same v12 implementation | 6 | 19.1 | 12.8 | 32.3 | 179.9 | ~0.2 | 244.3 | 290.8 | — |
-| Same v12 implementation | 12 | 14.9 | 8.6 | 24.8 | 137.6 | ~0.3 | 186.2 | 317.4 | Fastest v12 worker setting |
+The implementation is designed around:
 
-The direct two-pass builder counts edges, prefixes, then reparses the input to
-place them. The retained builder parses once into thread-local edge buckets,
-then compacts those buckets into CSR. On the measured v12 build, its parse plus
-CSR phases were 23.5 ms at 12 workers, compared with 54.5 ms for direct
-two-pass CSR. Direct two-pass CSR used about 9.6 MiB less peak RSS in that
-comparison, but took longer overall and did not include the later locality and
-query improvements. The final version also unmaps input files promptly and
-reduced the BFS queue reservation, lowering observed peak RSS.
+- Large graph input.
+- Efficient graph parsing.
+- Compact adjacency storage.
+- Parallel graph construction.
+- Improved graph memory locality.
+- Repeated queries sharing source vertices.
+- Efficient shortest-path computation.
+- Correct handling of distances exceeding 32-bit range.
 
-CSR was retained because contiguous offsets, destinations, and weights give
-compact storage and predictable adjacency scans. The parallel BFS relabel is
-worth its preprocessing cost: disabling it more than doubled the measured
-query phase.
+**Optimization direction:** Minimize graph construction overhead, improve memory access patterns, reuse shortest-path searches and avoid exploring unnecessary parts of the graph.
 
-## Priority queue and shortest-path experiments
+---
 
-The following heap comparison used the same full dataset and v5-family graph
-preparation. Phase values are one instrumented run per variant; outer wall and
-RSS are medians from three uninstrumented runs. This isolates the heap change
-better than comparing unrelated end-to-end versions.
+## 2. Optimization Journey
 
-| Heap | Workers | Parse | CSR | BFS | Queries | Output | Instrumented total | Outer wall median (range) | Peak RSS | Decision |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| `std::priority_queue` with packed keys | 12 | 25.5 | 27.7 | 89.3 | 209.0 | ~0.2 | 351.7 | 0.364 s (0.358–0.920) | 352.2 | Rejected |
-| Packed binary STL heap | 12 | 25.1 | 28.3 | 93.4 | 221.4 | ~0.2 | 368.4 | 0.377 s (0.373–0.807) | 352.9 | Rejected |
-| Custom 4-ary heap | 12 | 25.0 | 28.1 | 89.0 | 214.4 | ~0.3 | 356.8 | 0.370 s (0.357–0.783) | 352.9 | Rejected |
-| Monotone radix heap | 12 | 25.5 | 28.7 | 92.4 | 159.8 | ~0.2 | 306.6 | 0.317 s (0.317–0.827) | 356.6 | Kept |
+### Stage 1 — Understanding the workload
 
-The radix heap reduced the measured query phase by about 23% versus the packed
-`std::priority_queue` variant. Its small RSS increase was acceptable. Packed
-64-bit `(distance, vertex)` keys are used on the normal `uint32_t` pass; groups
-that encounter an overflowing candidate are rerun with `uint64_t` distances.
+The first step was examining the graph structure and query workload.
 
-Bidirectional Dijkstra with a reverse CSR was also measured: parse 25.3 ms,
-forward CSR 10.8 ms, BFS 26.3 ms, reverse CSR 15.7 ms, queries 362.2 ms,
-output 0.2 ms, total 440.6 ms, and peak RSS 477.0 MiB (one instrumented full
-run). It was rejected because it was slower than the one-sided grouped-source
-radix search and substantially increased memory.
+The implementation needs to process a directed weighted graph and answer multiple source-target shortest-path queries.
 
-Grouping queries by source was retained. An eight-run uninstrumented A/B gave
-0.198 s median for grouped queries versus 0.200 s for one search per query;
-the difference was within run-to-run noise. Grouping still avoids repeated
-searches for shared sources and permits stopping once every requested target
-settles. The one-per-query instrumented run measured parse 26.5 ms, CSR 10.8
-ms, BFS 30.0 ms, queries 136.7 ms, output 0.2 ms, total 204.2 ms, and 220.0
-MiB RSS. The grouped final profile is reported below.
+The main challenges are:
 
-An in-degree-zero target shortcut (with `source == target` handled first) and
-an out-degree-zero source shortcut were retained. Disabling the in-degree
-shortcut measured parse 26.5 ms, CSR 7.8 ms, BFS 29.7 ms, queries 164.7 ms,
-output 0.3 ms, total 229.0 ms, and 252.8 MiB RSS. This also avoids graph
-searches that cannot produce a path.
+1. Reading a large graph efficiently.
+2. Constructing a compact adjacency representation.
+3. Reducing graph traversal overhead.
+4. Avoiding repeated searches from identical source vertices.
+5. Reducing priority-queue overhead.
+6. Handling large shortest-path distances correctly.
+7. Using multiple CPU cores effectively.
 
-## Final implementation and worker counts
+**Optimization direction:** Optimize both graph preprocessing and shortest-path execution rather than focusing only on Dijkstra's algorithm.
 
-These phase values are one instrumented run per worker count of the final
-implementation. Peak RSS is from a separate uninstrumented three-run sweep of
-the final source. The one-run timing at 12 workers was affected by host
-variance; the separate repeated timings below are a better summary of T.
+### Stage 2 — Memory-mapped graph input
 
-| Workers | Parse | CSR | BFS | Queries | Output | Instrumented total | Peak RSS, separate 3-run sweep |
-|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 190.3 | 45.8 | 76.4 | 891.4 | 0.2 | 1,204.0 | 146.3 MiB |
-| 2 | 42.0 | 20.8 | 49.1 | 539.7 | 0.2 | 651.8 | 179.6 MiB |
-| 4 | 37.2 | 15.9 | 38.1 | 275.8 | 0.2 | 367.3 | 185.5 MiB |
-| 6 | 25.3 | 11.8 | 43.1 | 199.4 | 0.2 | 279.8 | 204.4 MiB |
-| 12 | 25.0 | 8.5 | 28.7 | 200.9 | 0.2 | 263.2 | 219.7 MiB |
+**Problem:** Reading a large graph through repeated input operations can introduce unnecessary overhead.
 
-For final source, an uninstrumented five-run 12-worker set had raw wall times
-of 0.212, 0.206, 0.193, 0.205, and 0.217 seconds. The middle-three mean was
-0.207 seconds, with 224.9 MiB peak RSS. A separate three-run worker sweep gave
-medians/ranges of 1.386 s (1.271–1.397) at 1 worker, 0.704 s (0.683–0.716) at
-2, 0.445 s (0.413–0.456) at 4, 0.325 s (0.325–0.336) at 6, and 0.263 s
-(0.260–0.266) at 12. The latter run set was slower than the five-run set,
-consistent with scheduling or thermal noise; 12 workers was fastest in both.
+**Optimization:** Used `mmap()` to map `graph.txt` directly into memory.
 
-## Container contract run
+The `map_file()` function:
 
-The official `harness/run_submission.py` was run for five full-seed-1 runs.
-The submission image built successfully with `docker build --network=none`
-from the locally cached pinned base images. The final arm64 image was
-140,917,570 bytes. The official harness passed its correctness, timeout, and
-sandbox gates; all runs exited 0, matched the published output hash, and had
-an empty `docker diff` outside the allowed mounts.
+1. Opens the input file.
+2. Retrieves its size using `fstat()`.
+3. Maps the file using `mmap()`.
+4. Returns a pointer to the mapped data.
 
-| Run | Timer wall (s) | Kernel `memory.peak` (bytes) |
-|---:|---:|---:|
-| 1 | 0.280487 | 206,135,296 |
-| 2 | 0.266404 | 206,524,416 |
-| 3 | 0.257456 | 206,544,896 |
-| 4 | 0.273439 | 206,581,760 |
-| 5 | 0.348351 | 206,528,512 |
+The graph is then parsed directly from memory.
 
-The harness dropped the lowest and highest times, giving **T = 0.273443 s**;
-**M = 206,581,760 bytes (197.0 MiB)**, the highest of the five memory peaks.
-The batch spread gate passed. This ran in Docker Desktop's Linux arm64 VM with
-10 available CPUs pinned as `0-9`, not on the scoring i5-13500; it is a local
-contract check, not an official score measurement.
+After graph parsing and construction, the mapping is released using `munmap()`.
 
-The harness's normal cgroup reader expects Linux `/sys/fs/cgroup` on the host,
-which macOS cannot access directly. For this run, only that reader command was
-redirected into a temporary privileged helper container in the Docker VM,
-using `--network=none`, `--pull=never`, and `--cgroupns=host`. It read the same
-run-specific `memory.peak` file and removed the completed cgroup; the official
-build, timer, run contract, output/hash checks, and filesystem-diff checks were
-unchanged. The helper image had to be pulled separately because the local
-cache contained the pinned Debian base only by digest without the helper tag;
-the submission build and the harness containers themselves used no network.
+**Why it helps:**
+- Avoids explicitly copying the entire graph file into another buffer.
+- Allows direct pointer-based parsing.
+- Reduces application-level input buffering.
+- Supports efficient partitioning of the input data.
 
-Additional final-source ablations:
+### Stage 3 — Fast integer parsing
 
-| Experiment | Parse | CSR | BFS | Queries | Output | Total | Peak RSS | Finding |
-|---|---:|---:|---:|---:|---:|---:|---:|---|
-| BFS locality reorder disabled, one profile | 23.2 | 9.1 | 0.6 | 303.3 | 0.2 | 336.4 | 202.1 MiB (max of 8 uninstrumented runs) | Rejected; query phase rose from roughly 140 ms to 303 ms, outweighing the saved 28 ms preprocessing |
-| Generation-counter distance arrays, one profile | 25.1 | 8.6 | 27.0 | 149.3 | 0.2 | 210.2 | 283.4 MiB | Rejected; interleaved 12-run A/B was slightly slower (0.199 vs 0.197 s median) and used about 59 MiB more than the touched-node list |
-| Final touched-node distance reset, phase medians | 18.0 | 8.3 | 28.1 | 140.3 | 0.2 | 198.8 | 229.1 MiB instrumented | Kept; lower memory and slightly faster in the interleaved A/B |
+**Problem:** Standard formatted input functions can introduce overhead when parsing millions of numeric values.
 
-The locality reorder assigns vertices in parallel BFS order, then rewrites CSR
-arcs. The benefit comes from improved graph locality during Dijkstra. Per
-worker distance arrays are memory-mapped lazily and reset only at touched
-vertices; generation counters were tested and were both slower and larger on
-this host. Padded relaxed-atomic job cursors limit false sharing while workers
-take independent source groups.
+**Optimization:** Implemented a custom unsigned decimal parser.
 
-## Bottlenecks and limits
+The `num()` function:
 
-On the final 12-worker profile, query processing remained the largest single
-phase, while parsing and CSR construction were each below 35 ms combined in
-the repeated profile. Output was about 0.2 ms and is not a meaningful
-bottleneck. Local results favor 12 workers, but the official host has a
-different CPU and limits; its optimum and peak cgroup memory may differ from
-the local Docker contract run above.
+- Skips whitespace.
+- Reads consecutive decimal digits.
+- Builds the integer directly.
+- Advances the input pointer.
+
+The `skip()` function handles spaces, tabs, carriage returns and newlines.
+
+**Why it helps:**
+- Avoids repeated formatted input operations.
+- Reduces parsing overhead.
+- Uses direct pointer advancement.
+- Keeps the graph parser simple.
+
+### Stage 4 — Parallel graph partitioning
+
+**Problem:** Parsing the entire graph sequentially limits graph construction throughput.
+
+**Optimization:** Divided the graph input into approximately equal-sized byte ranges.
+
+Each worker receives a portion of the mapped graph.
+
+Partitions are aligned to newline boundaries so that individual edge records remain intact.
+
+Each worker parses edge records containing:
+
+- Source vertex.
+- Destination vertex.
+- Edge weight.
+
+**Why it helps:**
+- Allows graph parsing to happen concurrently.
+- Reduces sequential input-processing work.
+- Creates independent worker-local edge collections.
+- Avoids synchronization during ordinary edge parsing.
+
+### Stage 5 — Worker-local edge buckets
+
+**Problem:** Multiple workers inserting edges into shared graph structures would require synchronization and could create contention.
+
+**Optimization:** Introduced a two-dimensional collection of edge buckets:
+
+`B[T * T]`
+
+Each parsing worker has separate destination buckets.
+
+Edges are assigned to buckets according to the source vertex's destination partition.
+
+**Why it helps:**
+- Avoids a shared insertion point.
+- Reduces contention during graph construction.
+- Groups edges by the vertex range that will own their CSR rows.
+- Makes the later CSR construction easier to parallelize.
+
+After the buckets have been consumed, their allocated storage is released.
+
+### Stage 6 — Compressed Sparse Row (CSR) construction
+
+**Problem:** A graph represented using many independent adjacency vectors can introduce allocation overhead and poor memory locality.
+
+**Optimization:** Constructed the graph using Compressed Sparse Row storage.
+
+The graph uses:
+
+- `off[]` to store adjacency row boundaries.
+- `arc[]` to store destination vertices and edge weights.
+
+Each adjacency list is represented as a contiguous range:
+
+`arc[off[u] ... off[u + 1])`
+
+The implementation first counts outgoing edges for each vertex, calculates row boundaries, and then fills the final edge array.
+
+**Why it helps:**
+- Stores graph edges contiguously.
+- Avoids one allocation per vertex.
+- Improves adjacency traversal locality.
+- Reduces pointer indirection.
+- Provides efficient neighbor iteration.
+
+The CSR representation is especially useful because Dijkstra repeatedly scans outgoing edges.
+
+### Stage 7 — Parallel CSR row construction
+
+**Problem:** Building all adjacency rows sequentially would leave significant graph preprocessing work on one CPU core.
+
+**Optimization:** Assigned separate vertex ranges to different workers.
+
+Each worker:
+
+1. Counts outgoing edges for its assigned vertices.
+2. Calculates row boundaries.
+3. Fills the corresponding adjacency rows.
+4. Releases consumed edge buckets.
+
+The destination partitions are organized so that workers can write into their assigned CSR regions.
+
+**Why it helps:**
+- Parallelizes adjacency construction.
+- Reduces shared-write contention.
+- Produces a compact final graph representation.
+- Separates graph construction by vertex range.
+
+### Stage 8 — Graph relabeling using parallel BFS
+
+**Problem:** The original vertex numbering may not provide good memory locality during graph traversal.
+
+Vertices that are frequently reached from one another may have IDs that are far apart.
+
+**Optimization:** Introduced a parallel graph relabeling phase based on breadth-first traversal.
+
+The implementation:
+
+1. Divides the original vertex range into regions.
+2. Starts a traversal from each region.
+3. Uses an atomic compare-and-exchange operation to claim previously unvisited vertices.
+4. Records discovered vertices in worker-local BFS order.
+5. Calculates the new vertex-ID ranges.
+6. Builds a mapping from old IDs to new IDs.
+7. Reconstructs the graph using the new IDs.
+
+**Why it helps:**
+- Attempts to place related traversal vertices closer together.
+- Can improve adjacency and metadata access locality.
+- Reduces some irregular memory-access costs.
+- Provides a reordered graph for the shortest-path phase.
+
+The relabeling is performed before queries are parsed into their final internal vertex IDs.
+
+### Stage 9 — Rebuilding CSR after relabeling
+
+**Problem:** Changing vertex IDs requires the adjacency structure to be updated as well.
+
+**Optimization:** Allocated a new CSR representation and rebuilt every edge using the old-to-new vertex mapping.
+
+For each reordered vertex:
+
+- Its adjacency row is assigned a new offset.
+- Every destination vertex is translated using `perm[]`.
+- Edge weights are preserved.
+- The original graph arrays are released after reconstruction.
+
+The `hasin` metadata is also transferred to the new vertex numbering.
+
+**Why it helps:**
+- Keeps the graph representation consistent after relabeling.
+- Preserves directed edge relationships.
+- Produces a contiguous graph structure in the new numbering.
+- Releases the original CSR storage once it is no longer required.
+
+### Stage 10 — Early query filtering
+
+**Problem:** Some source-target queries can be resolved without running Dijkstra.
+
+**Optimization:** Added inexpensive checks before scheduling graph searches.
+
+The implementation immediately handles:
+
+- Source equals target: distance is zero.
+- Target has no incoming edge from another vertex: unreachable from a different source.
+- Source has no outgoing edges: no different target can be reached.
+
+Queries that pass these checks are added to the search workload.
+
+**Why it helps:**
+- Avoids unnecessary shortest-path searches.
+- Reduces the number of scheduled jobs.
+- Handles simple cases with constant-time checks.
+
+The `hasin` flag is built during graph construction and retained through graph relabeling.
+
+### Stage 11 — Grouping queries by source
+
+**Problem:** Running Dijkstra independently for every query repeats substantial graph traversal when multiple queries share a source vertex.
+
+**Optimization:** Sorted queries by source and then target vertex.
+
+Queries with the same source are grouped into a single `Group`.
+
+Each group contains:
+
+- Source vertex.
+- First query position.
+- Last query position.
+
+The shortest-path search processes all requested targets in the group.
+
+Once every target has been settled, the search terminates early.
+
+**Why it helps:**
+- Reuses one search for multiple targets.
+- Avoids repeating exploration from the same source.
+- Reduces unnecessary graph traversal.
+- Makes early termination possible.
+
+This is one of the most important algorithmic optimizations in the implementation.
+
+### Stage 12 — Early-exit Dijkstra
+
+**Problem:** Standard single-source Dijkstra continues until the entire reachable graph has been processed.
+
+However, the workload only requires distances to a limited set of requested targets.
+
+**Optimization:** Modified the search to stop when every target in the current source group has been settled.
+
+The algorithm:
+
+1. Starts from the group's source vertex.
+2. Extracts the minimum-distance candidate.
+3. Ignores stale queue entries.
+4. Checks whether the extracted vertex is a requested target.
+5. Records its shortest distance.
+6. Stops once all requested targets have been settled.
+7. Otherwise, relaxes its outgoing edges.
+
+**Why it helps:**
+- Avoids exploring unnecessary graph regions.
+- Stops as soon as the required answers are available.
+- Makes search work dependent on requested targets rather than requiring a complete single-source traversal.
+
+### Stage 13 — Monotone radix heap
+
+**Problem:** A conventional binary heap introduces logarithmic insertion and extraction costs.
+
+Dijkstra's algorithm processes nondecreasing distance keys, making it suitable for a monotone integer priority queue.
+
+**Optimization:** Implemented a radix heap with 65 buckets.
+
+The queue groups entries according to the highest differing bit between the distance and the last extracted distance.
+
+The implementation:
+
+- Inserts distance-vertex pairs into radix buckets.
+- Extracts directly from bucket zero when possible.
+- Finds the next nonempty bucket when bucket zero is empty.
+- Finds the minimum key in that bucket.
+- Redistributes its entries.
+- Continues processing in nondecreasing distance order.
+
+**Why it helps:**
+- Uses the monotonicity of Dijkstra's distance extraction.
+- Avoids a conventional binary-heap structure.
+- Provides an integer-key-oriented priority queue.
+- Can reduce priority-queue overhead for suitable workloads.
+
+### Stage 14 — Complemented distance map
+
+**Problem:** A distance array needs a way to distinguish an unvisited vertex from a vertex whose distance is zero.
+
+**Optimization:** Stores complemented distances.
+
+The implementation uses:
+
+- Zero to represent an unseen vertex.
+- Bitwise-complemented distance values for visited vertices.
+
+The source is initialized with the complemented representation of zero.
+
+Distance comparisons are performed against the complemented values.
+
+**Why it helps:**
+- Avoids a separate visited array.
+- Combines visitation state and distance storage.
+- Reduces per-search metadata requirements.
+
+The `touched` vector tracks vertices whose distance entries must be reset after the search.
+
+### Stage 15 — Reusing search memory
+
+**Problem:** Clearing a full distance array after every search would require work proportional to the total number of vertices, even when a search visits only a small part of the graph.
+
+**Optimization:** Introduced a worker-local `touched` vector.
+
+Whenever a vertex is first discovered, it is added to this vector.
+
+At the end of the search, only touched vertices are reset.
+
+The radix-heap buckets are also cleared for reuse.
+
+**Why it helps:**
+- Avoids full-array clearing between searches.
+- Makes cleanup proportional to the number of visited vertices.
+- Reuses allocated search structures.
+- Reduces repeated memory initialization work.
+
+### Stage 16 — Parallel shortest-path jobs
+
+**Problem:** Independent source groups can be processed concurrently.
+
+**Optimization:** Distributed source-group jobs among worker threads.
+
+Each worker owns its own `Search` instance, including:
+
+- Distance storage.
+- Touched vertices.
+- Radix-heap buckets.
+- Search counters.
+
+The implementation uses atomic job cursors to distribute work dynamically within assigned job ranges.
+
+**Why it helps:**
+- Executes independent source groups concurrently.
+- Avoids sharing mutable search state.
+- Allows workers to reuse their own search memory.
+- Reduces the impact of uneven job durations compared with fixed one-job-per-thread assignment.
+
+The number of workers is determined from the available CPU affinity where supported, with an optional `SD_T` override.
+
+### Stage 17 — 32-bit and 64-bit distance handling
+
+**Problem:** Using 64-bit distances for every search increases distance-storage and queue-key costs, even when ordinary shortest paths fit within 32 bits.
+
+However, silently overflowing a 32-bit distance would produce incorrect results.
+
+**Optimization:** Implemented a two-stage distance strategy.
+
+**First pass:**
+
+- Runs Dijkstra with 32-bit distance values.
+- Detects when a candidate distance exceeds the representable range.
+- Marks the corresponding source group as requiring a wider search.
+
+**Second pass:**
+
+- Collects only groups marked as overflowed.
+- Reruns those groups using 64-bit distances.
+
+**Why it helps:**
+- Keeps the common search path compact.
+- Avoids using wider distance storage for every search.
+- Preserves correctness for larger distances.
+- Limits the cost of 64-bit searches to groups that require them.
+
+### Stage 18 — Cache prefetching
+
+**Problem:** Graph traversal involves irregular adjacency and metadata accesses.
+
+The next vertices and their adjacency rows may not already be present in CPU cache.
+
+**Optimization:** Added compiler prefetch hints at selected traversal points.
+
+Prefetching is used for:
+
+- Future CSR row offsets.
+- Future adjacency entries.
+- Future vertex metadata during BFS relabeling.
+- Selected adjacency data during Dijkstra.
+
+**Why it helps:**
+- Attempts to bring data into cache before it is needed.
+- Can reduce memory-stall time for suitable access patterns.
+- Targets the irregular memory-access behavior of graph algorithms.
+
+Prefetching is workload- and hardware-dependent, so its actual benefit must be verified through benchmarking.
+
+### Stage 19 — Output construction
+
+**Problem:** Repeated formatted output operations can add overhead when writing many query results.
+
+**Optimization:** Builds the complete output in a character buffer.
+
+The implementation:
+
+1. Reserves output capacity.
+2. Converts each distance to decimal manually.
+3. Writes `-1` for unreachable results.
+4. Appends one newline per query.
+5. Writes the resulting buffer using a low-level file descriptor.
+
+The output is written in original query order because answers are stored by their original query index.
+
+**Why it helps:**
+- Avoids repeated stream formatting.
+- Reduces output-system-call overhead.
+- Preserves query order.
+- Produces a compact output buffer.
+
+---
+
+## 3. Final Architecture
+
+```text
+                  graph.txt
+                      |
+                      v
+                   mmap()
+                      |
+                      v
+               Parallel Parsing
+                      |
+          +-----------+-----------+
+          |           |           |
+          v           v           v
+       Worker 1    Worker 2    Worker N
+          |           |           |
+          +-----------+-----------+
+                      |
+                      v
+              Worker-local Buckets
+                      |
+                      v
+             Parallel CSR Construction
+                      |
+                      v
+                Initial Graph
+                      |
+                      v
+              Parallel BFS Relabeling
+                      |
+                      v
+              Old-to-New ID Mapping
+                      |
+                      v
+              Rebuilt CSR Graph
+                      |
+                      v
+                  queries.txt
+                      |
+                      v
+                Query Translation
+                      |
+                      v
+                 Early Filtering
+                      |
+                      v
+              Group Queries by Source
+                      |
+                      v
+             Parallel Source-group Jobs
+                      |
+                      v
+              Early-exit Dijkstra
+                      |
+                      v
+                 Radix Heap
+                      |
+              +-------+-------+
+              |               |
+              v               v
+          32-bit pass     Overflow groups
+                              |
+                              v
+                         64-bit rerun
+              |               |
+              +-------+-------+
+                      |
+                      v
+                Result Buffer
+                      |
+                      v
+                 distances.txt
+```
+
+---
+
+## 4. Performance Optimization Principles
+
+| Optimization | Main benefit |
+|---|---|
+| Memory-mapped graph input | Avoids explicit full-file copying |
+| Custom integer parser | Reduces parsing overhead |
+| Parallel input partitioning | Uses multiple CPU cores |
+| Worker-local edge buckets | Reduces shared-write contention |
+| CSR graph representation | Compact adjacency storage |
+| Parallel CSR construction | Faster graph preprocessing |
+| Parallel BFS relabeling | Attempts to improve graph locality |
+| Query pre-filtering | Avoids unnecessary searches |
+| Source grouping | Reuses shortest-path searches |
+| Early-exit Dijkstra | Avoids unnecessary exploration |
+| Monotone radix heap | Optimizes integer priority-queue operations |
+| Complemented distance map | Combines visited state and distance storage |
+| Touched-vertex reset | Avoids clearing the entire distance array |
+| Worker-local search state | Avoids shared mutable search structures |
+| 32-bit fast path | Reduces common-case distance storage |
+| 64-bit overflow rerun | Preserves large-distance correctness |
+| Cache prefetching | Attempts to reduce memory stalls |
+| Buffered output | Reduces formatting and write overhead |
+
+---
+
+## 5. Correctness and Validation
+
+Performance improvements must not change shortest-path results.
+
+### Graph correctness
+
+- Directed edges must retain their original direction.
+- Edge weights must remain unchanged.
+- Every edge must appear in the correct adjacency row.
+- Vertex relabeling must preserve graph connectivity.
+- The old-to-new mapping must be applied consistently to queries.
+
+### Shortest-path correctness
+
+- Dijkstra must process nonnegative edge weights.
+- Stale priority-queue entries must be ignored.
+- A target is finalized only when its minimum-distance entry is extracted.
+- A source-target query with identical vertices returns zero.
+- Unreachable targets return `-1`.
+
+### Distance-range correctness
+
+- 32-bit overflow must be detected.
+- Overflowed source groups must be rerun using 64-bit distances.
+- No valid large distance may be silently truncated.
+
+### Query correctness
+
+- Queries sharing a source must all receive their correct answers.
+- Early termination must happen only after all requested targets are settled.
+- Answers must remain associated with their original query indices.
+
+### Recommended validation
+
+1. Compare all output lines against the reference implementation.
+2. Verify SHA-256 equality.
+3. Test a graph with no edges.
+4. Test isolated vertices.
+5. Test source equal to target.
+6. Test unreachable targets.
+7. Test multiple queries sharing one source.
+8. Test directed edges where reverse paths do not exist.
+9. Test zero-weight edges if permitted by the specification.
+10. Test large shortest-path distances.
+11. Test different `SD_T` values.
+12. Compare results with and without graph relabeling.
+
+---
+
+## 6. Build and Execution
+
+### Runtime invocation
+
+```bash
+./solution --data /data --out /out
+```
+
+### Input files
+
+```text
+/data/graph.txt
+/data/queries.txt
+```
+
+### Expected output
+
+```text
+/out/distances.txt
+```
+
+### Thread configuration
+
+The implementation supports:
+
+```bash
+SD_T=8
+```
+
+This overrides the detected worker count when set to a nonzero value.
+
+The default worker count is based on hardware concurrency and, on Linux, the process CPU affinity mask.
+
+---
+
+## 7. Conclusion
+
+The Track D implementation optimizes both graph preprocessing and shortest-path query execution.
+
+Rather than treating every query as an independent Dijkstra run, it groups queries by source and shares the search across requested targets.
+
+The main architectural decisions were:
+
+- Memory-mapped graph parsing.
+- Parallel edge collection.
+- Compact CSR graph storage.
+- Parallel graph relabeling.
+- Source-grouped query execution.
+- Early-exit Dijkstra.
+- Monotone radix-heap priority queues.
+- Worker-local search memory.
+- Selective 64-bit distance reruns.
+- Buffered output generation.
+
+The central design principle was to reduce repeated work and improve the efficiency of graph traversal.
+
+**Optimization philosophy: Build the graph efficiently. Reuse searches wherever possible. Stop when the required answers are found. Keep memory access and distance handling efficient.**
