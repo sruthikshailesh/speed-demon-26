@@ -6,11 +6,9 @@
 // a uint32 search that exceeds its range is rerun with uint64 distances.
 //
 // Runtime paths: solution --data /data --out /out
-
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -28,7 +26,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 static const char* map_file(const std::string& path, size_t& len) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) exit(1);
