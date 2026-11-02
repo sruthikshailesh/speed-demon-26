@@ -4,7 +4,6 @@
 // Each thread aggregates its slice in private open-addressing tables; the slices
 // are then merged in (hour, endpoint) order, and percentile selection plus text
 // formatting run together in parallel batches that are written out in order.
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -21,9 +20,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
 namespace {
-
 constexpr uint64_t kMul = 0x9E3779B97F4A7C15ull;
 constexpr size_t kBatch = 2048;  // groups per output batch
 
@@ -38,7 +35,6 @@ struct Work {  // one per thread; hash slots hold index + 1, 0 means empty
     std::vector<uint32_t> es = std::vector<uint32_t>(2048), gs = std::vector<uint32_t>(4096);
     size_t last = 0;                   // most recently used group
 };
-
 int thread_count() {
     unsigned n = std::thread::hardware_concurrency();
 #if defined(__linux__)
@@ -47,13 +43,11 @@ int thread_count() {
 #endif
     return int(std::min(12u, std::max(1u, n)));
 }
-
 template <class F> void par(int n, F f) {
     std::vector<std::thread> ts;
     for (int i = 0; i < n; ++i) ts.emplace_back([&f, i] { f(i); });
     for (std::thread& t : ts) t.join();
 }
-
 inline uint64_t hash_bytes(const char* s, size_t n) {  // length + first and last 8 bytes; equality is still a full compare
     uint64_t first = 0, last = 0;
     if (n >= 8) { std::memcpy(&first, s, 8); std::memcpy(&last, s + n - 8, 8); }
@@ -61,9 +55,7 @@ inline uint64_t hash_bytes(const char* s, size_t n) {  // length + first and las
     uint64_t h = ((first ^ n * kMul) * kMul ^ last) * kMul;
     return h ^ (h >> 32);
 }
-
 inline size_t group_hash(uint32_t hour, uint32_t ep) { return size_t(((uint64_t(hour) << 32 | ep) * kMul) >> 32); }
-
 template <class H> void grow(std::vector<uint32_t>& s, size_t n, H hash) {
     std::vector<uint32_t> t(s.size() * 2);
     for (size_t i = 0; i < n; ++i) {
@@ -73,7 +65,6 @@ template <class H> void grow(std::vector<uint32_t>& s, size_t n, H hash) {
     }
     s.swap(t);
 }
-
 uint32_t add_ep(Work& w, std::string_view s) {
     const uint64_t h = hash_bytes(s.data(), s.size());
     const size_t m = w.es.size() - 1;
@@ -86,7 +77,6 @@ uint32_t add_ep(Work& w, std::string_view s) {
     if (w.ep.size() * 2 > w.es.size()) grow(w.es, w.ep.size(), [&](size_t i) { return w.eh[i]; });
     return uint32_t(w.ep.size() - 1);
 }
-
 Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
     const size_t m = w.gs.size() - 1;
     size_t j = group_hash(hour, ep) & m;
@@ -102,13 +92,11 @@ Group& add_group(Work& w, uint32_t hour, uint32_t ep) {
         grow(w.gs, w.group.size(), [&](size_t i) { return group_hash(w.group[i].hour, w.group[i].ep); });
     return w.group.back();
 }
-
 inline uint32_t hour_key(const char* p) {  // "YYYY-MM-DDTHH" -> YYYYMMDDHH
     auto d = [&](int i) { return uint32_t(p[i] - '0'); };
     return (((d(0) * 1000 + d(1) * 100 + d(2) * 10 + d(3)) * 100 + d(5) * 10 + d(6)) * 100 + d(8) * 10 + d(9)) * 100 +
            d(11) * 10 + d(12);
 }
-
 // One line is "<27-byte timestamp> <method> <endpoint> <status> <latency>"; the spec guarantees it.
 void parse_slice(const char* p, const char* end, Work& w) {
     const char* hp = nullptr;  // line whose hour prefix was last decoded
@@ -137,7 +125,6 @@ void parse_slice(const char* p, const char* end, Work& w) {
         g->lat.push_back(lat);
     }
 }
-
 void score_group(Group& g) {  // nearest rank: ceil(p*n/100), 1-based
     std::vector<uint32_t>& v = g.lat;
     const size_t n = v.size();
@@ -150,14 +137,12 @@ void score_group(Group& g) {  // nearest rank: ceil(p*n/100), 1-based
         lo = int(r[k]);
     }
 }
-
 inline void put(char*& p, uint64_t v, int width = 0) {
     char t[24];
     int n = 0;
     do { t[n++] = char('0' + v % 10); v /= 10; } while (v || n < width);
     while (n) *p++ = t[--n];
 }
-
 void append_line(std::string& out, const Group& g, std::string_view ep) {
     char b[128], *p = b;
     put(p, g.hour / 1000000, 4); *p++ = '-'; put(p, g.hour / 10000 % 100, 2); *p++ = '-';
@@ -174,20 +159,16 @@ void append_line(std::string& out, const Group& g, std::string_view ep) {
     *p++ = '\n';
     out.append(b, size_t(p - b));
 }
-
 }  // namespace
-
 int main(int argc, char** argv) {
     const char *data_dir = "/data", *out_dir = "/out";
     for (int i = 1; i + 1 < argc; i += 2) (std::strcmp(argv[i], "--data") ? out_dir : data_dir) = argv[i + 1];
-
     const int fd = open((std::string(data_dir) + "/requests.log").c_str(), O_RDONLY);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) != 0) return 1;
     const size_t size = size_t(st.st_size);
     const char* map = size ? static_cast<const char*>(mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0)) : "";
     if (map == MAP_FAILED) return 1;
-
     // Slice boundaries sit just after a newline so no line is split.
     const int T = thread_count();
     std::vector<size_t> cut(T + 1, size);
@@ -199,13 +180,11 @@ int main(int argc, char** argv) {
     }
     std::vector<Work> work(T);
     par(T, [&](int t) { parse_slice(map + cut[t], map + cut[t + 1], work[t]); });
-
     // Rank every endpoint name once; ranks follow byte order, so (hour, rank) is the output order.
     std::vector<std::string_view> names;
     for (const Work& w : work) names.insert(names.end(), w.ep.begin(), w.ep.end());
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
-
     struct Item { uint64_t key; uint32_t t, g; };
     std::vector<Item> items;
     for (int t = 0; t < T; ++t) {
@@ -217,7 +196,6 @@ int main(int argc, char** argv) {
         }
     }
     std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.key < b.key; });
-
     std::vector<Group> groups;  // one per (hour, endpoint), slices merged
     groups.reserve(items.size());
     for (const Item& it : items) {
@@ -234,7 +212,6 @@ int main(int argc, char** argv) {
             groups.push_back(std::move(g));
         }
     }
-
     // Percentiles and formatting in one parallel pass; batches are written in order.
     const size_t nb = (groups.size() + kBatch - 1) / kBatch;
     std::vector<std::string> bufs(nb);
@@ -246,7 +223,6 @@ int main(int argc, char** argv) {
                 append_line(bufs[b], groups[i], names[groups[i].ep]);
             }
     });
-
     mkdir(out_dir, 0777);
     const int ofd = open((std::string(out_dir) + "/summary.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ofd < 0) return 1;
